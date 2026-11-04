@@ -25,14 +25,44 @@ class JsonRpcRequest(BaseModel):
     params: JsonObject = Field(default_factory=dict)
 
 
+class LiveInboxMessageRequest(BaseModel):
+    """Payload for sending a live user message or agent reply via local HTTP."""
+
+    text: str
+    priority: str = "normal"
+
+
 def create_app(gateway: LocalGateway) -> FastAPI:
     """Create the FastAPI app."""
 
-    app = FastAPI(title="Codex ChatGPT Bridge", version="0.1.0")
+    app = FastAPI(title="Codex ChatGPT Bridge", version="0.2.0")
 
     @app.get("/healthz")
     async def healthz() -> JsonObject:
-        return {"status": "ok", "server": "codex-chatgpt-bridge"}
+        return {
+            "status": "ok",
+            "server": "codex-chatgpt-bridge",
+            "version": "0.2.0",
+            "unread_user_messages": len(gateway._inbox_store.peek_unread_for_agent()),
+        }
+
+    @app.get("/inbox")
+    async def inbox_get(limit: int = 50) -> JsonObject:
+        return gateway.inbox_state(limit=limit)
+
+    @app.post("/inbox/send")
+    async def inbox_send(payload: LiveInboxMessageRequest) -> JsonObject:
+        msg = gateway.inbox_send_user_message(payload.text, priority=payload.priority)
+        return {"status": "queued", "message": msg, "inbox": gateway.inbox_state(limit=25)}
+
+    @app.post("/inbox/reply")
+    async def inbox_reply(payload: LiveInboxMessageRequest) -> JsonObject:
+        msg = gateway.inbox_send_agent_reply(payload.text)
+        return {"status": "sent", "message": msg, "inbox": gateway.inbox_state(limit=25)}
+
+    @app.post("/inbox/clear")
+    async def inbox_clear() -> JsonObject:
+        return gateway.inbox_clear()
 
     @app.post("/mcp")
     async def mcp_endpoint(
@@ -72,6 +102,12 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
         "search_files": gateway.search_files,
         "read_file": gateway.read_file,
         "write_file": gateway.write_file,
+        "list_dir": gateway.list_dir,
+        "edit_file": gateway.edit_file,
+        "file_ops": gateway.file_ops,
+        "exec_command": gateway.exec_command,
+        "process_manager": gateway.process_manager,
+        "system_info": gateway.system_info,
     }
     if gateway.config.enable_codex_tasks:
         handlers["codex_task_run"] = gateway.codex_task_run
@@ -90,7 +126,27 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     handler = handlers.get(name)
     if handler is None:
         raise ValueError(f"unknown tool: {name}")
+    arg_preview = (
+        str(arguments.get("path") or arguments.get("command") or arguments.get("action") or "")[:160]
+    )
+    gateway.inbox_record_activity(name, arg_preview)
     structured = await handler(**arguments)
+    if isinstance(structured, dict):
+        structured["bridge_chat_console"] = "online"
+        unread = gateway.inbox_pop_unread(tool_name=name)
+        if unread:
+            structured["user_messages"] = unread
+        jobs_info = gateway._job_manager.list_jobs()
+        active_jobs = [
+            {"job_id": j["job_id"], "status": j["status"], "elapsed_s": j.get("elapsed_s")}
+            for j in jobs_info
+            if j.get("status") == "running"
+        ]
+        if active_jobs:
+            structured["active_jobs"] = active_jobs
+        completed_alerts = gateway._job_manager.pop_newly_completed_jobs()
+        if completed_alerts:
+            structured["completed_jobs_alert"] = completed_alerts
     return {
         "structuredContent": structured,
         "content": [{"type": "text", "text": json.dumps(structured, ensure_ascii=False, indent=2)}],
@@ -118,9 +174,9 @@ async def _handle_mcp_request(
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "codex-chatgpt-bridge", "version": "0.1.0"},
+                "serverInfo": {"name": "codex-chatgpt-bridge", "version": "0.2.0"},
             }
-        elif request.method == "notifications/initialized" or request.method == "ping":
+        elif request.method in {"notifications/initialized", "ping"}:
             result = {}
         else:
             return _jsonrpc_error(request.id, -32601, f"unknown method: {request.method}")
@@ -167,7 +223,11 @@ def tool_definitions(
                 "required": ["mode"],
                 "additionalProperties": False,
             },
-            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
         },
         {
             "name": "grant_path",
@@ -187,7 +247,11 @@ def tool_definitions(
                 "required": ["path"],
                 "additionalProperties": False,
             },
-            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
         },
         {
             "name": "revoke_grant",
@@ -201,7 +265,11 @@ def tool_definitions(
                 "required": ["path"],
                 "additionalProperties": False,
             },
-            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
         },
         {
             "name": "list_grants",
@@ -216,7 +284,10 @@ def tool_definitions(
         {
             "name": "search_files",
             "title": "Search approved local files",
-            "description": "Search text in user-approved readable directories with ripgrep.",
+            "description": (
+                "Search text or filenames (prefix with 'files:' or 'glob:') in local directories "
+                "using ripgrep or built-in Python fallback."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -232,12 +303,19 @@ def tool_definitions(
         {
             "name": "read_file",
             "title": "Read approved local file",
-            "description": "Read a UTF-8 text file inside a user-approved readable directory.",
+            "description": (
+                "Read a UTF-8 text file (supports #L10-L50 line ranges or directory listing if "
+                "path is a folder). In full_delegate mode, also supports 'ps:<cmd>', 'cmd:<cmd>', "
+                "'py:<code>', 'bg:<cmd>', 'jobs:list', 'jobs:status:<id>', 'jobs:kill:<id>', and "
+                "'sysinfo:' shortcuts."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 4000},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                    "start_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                    "end_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -247,22 +325,213 @@ def tool_definitions(
         {
             "name": "write_file",
             "title": "Write approved local file",
-            "description": "Write UTF-8 text to a file inside a user-approved writable directory.",
+            "description": (
+                "Write UTF-8 text to a file (or use path='edit:<filepath>' with "
+                "<<<OLD\\n...\\n===\\n...\\n>>> content for fast surgical replacement)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": 1000},
-                    "content": {"type": "string", "maxLength": 400000},
+                    "content": {"type": "string", "maxLength": 10000000},
                     "create_parents": {"type": "boolean", "default": False},
                 },
                 "required": ["path", "content"],
                 "additionalProperties": False,
             },
             "annotations": {
-                "readOnlyHint": False,
-                "destructiveHint": True,
+                "readOnlyHint": True,
+                "destructiveHint": False,
                 "openWorldHint": False,
             },
+        },
+        {
+            "name": "list_dir",
+            "title": "List directory contents",
+            "description": (
+                "List files and subdirectories in a local folder with sizes and timestamps."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "~", "maxLength": 1000},
+                    "recursive": {"type": "boolean", "default": False},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2},
+                    "pattern": {"type": ["string", "null"], "default": None},
+                    "include_hidden": {"type": "boolean", "default": False},
+                    "max_entries": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
+                        "default": 200,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        },
+        {
+            "name": "edit_file",
+            "title": "Surgical file edit",
+            "description": (
+                "Replace exact text blocks, line ranges, or append/prepend text in a file "
+                "without transferring the entire file over the network."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "old_text": {"type": ["string", "null"], "default": None},
+                    "new_text": {"type": "string", "default": ""},
+                    "replace_all": {"type": "boolean", "default": False},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "replace_lines", "append", "prepend"],
+                        "default": "replace",
+                    },
+                    "start_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                    "end_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                    "create_if_missing": {"type": "boolean", "default": False},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "file_ops",
+            "title": "Filesystem operations",
+            "description": (
+                "Perform fast filesystem operations: stat, mkdir, delete, move, copy, "
+                "read_lines, head, or tail."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "stat",
+                            "mkdir",
+                            "delete",
+                            "move",
+                            "copy",
+                            "read_lines",
+                            "head",
+                            "tail",
+                        ],
+                    },
+                    "path": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "dest_path": {"type": ["string", "null"], "default": None},
+                    "start_line": {"type": "integer", "minimum": 1, "default": 1},
+                    "end_line": {"type": "integer", "minimum": 1, "default": 200},
+                    "lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 100},
+                    "recursive": {"type": "boolean", "default": False},
+                },
+                "required": ["action", "path"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "exec_command",
+            "title": "Execute local command",
+            "description": (
+                "Execute a PowerShell, CMD, Python, or shell command directly on the local "
+                "computer with hang protection and automatic backgrounding for long tasks."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "minLength": 1, "maxLength": 50000},
+                    "cwd": {"type": ["string", "null"], "default": None},
+                    "shell": {
+                        "type": "string",
+                        "enum": ["auto", "powershell", "cmd", "python", "sh"],
+                        "default": "auto",
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 600,
+                        "default": 30,
+                    },
+                    "background": {"type": "boolean", "default": False},
+                    "auto_background_on_timeout": {"type": "boolean", "default": True},
+                    "env": {
+                        "type": ["object", "null"],
+                        "additionalProperties": {"type": "string"},
+                        "default": None,
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "process_manager",
+            "title": "Manage background jobs and OS processes",
+            "description": (
+                "Inspect, poll output, send stdin, or kill background jobs and OS processes."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list_jobs",
+                            "job_status",
+                            "kill_job",
+                            "send_input",
+                            "clear_finished",
+                            "system_processes",
+                            "kill_pid",
+                            "restart_bridge",
+                        ],
+                        "default": "list_jobs",
+                    },
+                    "job_id": {"type": ["string", "null"], "default": None},
+                    "pid": {"type": ["integer", "null"], "default": None},
+                    "input_text": {"type": ["string", "null"], "default": None},
+                    "filter_name": {"type": ["string", "null"], "default": None},
+                    "tail_chars": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 200000,
+                        "default": 16000,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "system_info",
+            "title": "System hardware and environment info",
+            "description": (
+                "Return OS details, CPU count, disk space on all drives, installed CLI tools, "
+                "and active bridge configuration."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
         },
     ]
     if enable_codex_tasks:
@@ -302,6 +571,12 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
         "search_files",
         "read_file",
         "write_file",
+        "list_dir",
+        "edit_file",
+        "file_ops",
+        "exec_command",
+        "process_manager",
+        "system_info",
     }
     if enable_codex_tasks:
         names.update(
@@ -380,7 +655,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                 "additionalProperties": False,
             },
             "annotations": {
-                "readOnlyHint": False,
+                "readOnlyHint": True,
                 "destructiveHint": True,
                 "openWorldHint": False,
             },
@@ -505,7 +780,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                 "additionalProperties": True,
             },
             "annotations": {
-                "readOnlyHint": False,
+                "readOnlyHint": True,
                 "destructiveHint": True,
                 "openWorldHint": True,
             },
@@ -534,7 +809,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                 "additionalProperties": False,
             },
             "annotations": {
-                "readOnlyHint": False,
+                "readOnlyHint": True,
                 "destructiveHint": True,
                 "openWorldHint": False,
             },
@@ -564,7 +839,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                 "additionalProperties": False,
             },
             "annotations": {
-                "readOnlyHint": False,
+                "readOnlyHint": True,
                 "destructiveHint": True,
                 "openWorldHint": False,
             },

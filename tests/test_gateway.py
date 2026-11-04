@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -96,7 +98,7 @@ async def test_runtime_mode_and_grant_tools_persist_to_config(tmp_path: Path) ->
 async def test_grant_path_defaults_to_read_only(tmp_path: Path) -> None:
     grant_path = tmp_path / "project"
     grant_path.mkdir()
-    gateway = LocalGateway(BridgeConfig())
+    gateway = LocalGateway(BridgeConfig(), config_path=tmp_path / "bridge.toml")
 
     result = await gateway.grant_path(path=str(grant_path))
 
@@ -525,3 +527,82 @@ def test_codex_exec_permission_args_match_exec_cli(tmp_path: Path) -> None:
     assert gateway._codex_permission_args("danger_full_access") == [
         "--dangerously-bypass-approvals-and-sandbox"
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_files_python_fallback_when_rg_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    sample = tmp_path / "hello.py"
+    sample.write_text("def magic_bridge_func():\n    return 42\n", encoding="utf-8")
+    gateway = LocalGateway(BridgeConfig(trust_mode="full_delegate"))
+
+    res = await gateway.search_files(query="magic_bridge_func", root=str(tmp_path))
+
+    assert res["engine"] == "python_native"
+    assert len(res["matches"]) == 1
+    assert res["matches"][0]["line"] == 1
+    assert "magic_bridge_func" in res["matches"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_exec_command_and_auto_background_and_process_manager(tmp_path: Path) -> None:
+    gateway = LocalGateway(BridgeConfig(trust_mode="full_delegate"))
+
+    fast = await gateway.exec_command(
+        command="print('hello_fast_bridge')",
+        shell="python",
+        cwd=str(tmp_path),
+    )
+    assert fast["returncode"] == 0
+    assert "hello_fast_bridge" in fast["stdout"]
+
+    # Test auto-background on timeout
+    slow = await gateway.exec_command(
+        command="import time; print('started', flush=True); time.sleep(10)",
+        shell="python",
+        cwd=str(tmp_path),
+        timeout_s=0.3,
+        auto_background_on_timeout=True,
+    )
+    assert slow["status"] == "running_in_background"
+    assert slow["timed_out"] is True
+    job_id = slow["job_id"]
+
+    status = await gateway.process_manager(action="job_status", job_id=job_id)
+    assert status["job"]["job_id"] == job_id
+
+    killed = await gateway.process_manager(action="kill_job", job_id=job_id)
+    assert killed["job"]["status"] == "killed"
+
+
+@pytest.mark.asyncio
+async def test_edit_file_list_dir_file_ops_and_shortcuts(tmp_path: Path) -> None:
+    gateway = LocalGateway(BridgeConfig(trust_mode="full_delegate"))
+    target = tmp_path / "sub" / "sample.txt"
+
+    await gateway.edit_file(
+        path=str(target),
+        new_text="line1\nline2\nline3\n",
+        create_if_missing=True,
+    )
+    await gateway.edit_file(
+        path=str(target),
+        old_text="line2",
+        new_text="line2_updated",
+    )
+    read_res = await gateway.read_file(path=f"{target}#L2-L2")
+    assert read_res["text"].strip() == "line2_updated"
+
+    # Directory read shortcut
+    dir_res = await gateway.read_file(path=str(tmp_path / "sub"))
+    assert dir_res["is_directory"] is True
+    parsed_dir = json.loads(dir_res["text"])
+    assert parsed_dir["entries"][0]["name"] == "sample.txt"
+
+    # Python exec shortcut through read_file
+    py_res = await gateway.read_file(path="py:print(21 * 2)")
+    parsed_py = json.loads(py_res["text"])
+    assert parsed_py["stdout"].strip() == "42"

@@ -132,7 +132,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
-    path = save_config(BridgeConfig(), args.config)
+    existing = load_config(args.config) if args.config.exists() else None
+    new_cfg = BridgeConfig()
+    if existing is not None:
+        new_cfg = new_cfg.model_copy(
+            update={
+                "auth_token": existing.auth_token,
+                "connector_secret": existing.connector_secret,
+            }
+        )
+    path = save_config(new_cfg, args.config)
     print(f"Created secure empty config: {path}")
     print("Next: codex-chatgpt-bridge grant ~/Projects --write --execute")
 
@@ -152,7 +161,63 @@ def _cmd_grant(args: argparse.Namespace) -> None:
     print(f"Granted: {args.path.expanduser().resolve(strict=False)}")
 
 
+def _apply_windows_socket_inheritance_protection() -> None:
+    """Ensure listening sockets created by Uvicorn are marked non-inheritable on Windows."""
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+    import socket
+    from uvicorn.config import Config
+    from uvicorn.server import Server
+
+    handle_flag_inherit = 0x00000001
+    try:
+        kernel32 = ctypes.windll.kernel32
+        h_stdin = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            new_mode = (mode.value & ~0x0040) | 0x0080
+            kernel32.SetConsoleMode(h_stdin, new_mode)
+    except Exception:
+        pass
+
+    def _mark_non_inheritable(sock: socket.socket) -> None:
+        try:
+            sock.set_inheritable(False)
+        except Exception:
+            pass
+        try:
+            ctypes.windll.kernel32.SetHandleInformation(
+                ctypes.c_void_p(sock.fileno()),
+                handle_flag_inherit,
+                0,
+            )
+        except Exception:
+            pass
+
+    orig_bind = Config.bind_socket
+
+    def bind_socket_safe(self: Config) -> socket.socket:
+        sock = orig_bind(self)
+        _mark_non_inheritable(sock)
+        return sock
+
+    Config.bind_socket = bind_socket_safe  # type: ignore[method-assign]
+
+    orig_startup = Server.startup
+
+    async def startup_safe(self: Server, sockets: list[socket.socket] | None = None) -> None:
+        await orig_startup(self, sockets=sockets)
+        for s in getattr(self, "servers", []) or []:
+            for sock in getattr(s, "sockets", []) or []:
+                _mark_non_inheritable(sock)
+
+    Server.startup = startup_safe  # type: ignore[method-assign]
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
+    _apply_windows_socket_inheritance_protection()
     config = load_config(args.config)
     if args.host:
         config.host = args.host
@@ -180,7 +245,7 @@ def _cmd_doctor(args: argparse.Namespace) -> None:
             f"read={grant.read} write={grant.write} execute={grant.execute}"
         )
     print(f"codex: {shutil.which('codex') or 'missing'}")
-    print(f"rg: {shutil.which('rg') or 'missing'}")
+    print(f"rg: {shutil.which('rg') or 'missing (using native Python search fallback)'}")
     print(f"cloudflared: {shutil.which('cloudflared') or 'optional, missing'}")
 
 

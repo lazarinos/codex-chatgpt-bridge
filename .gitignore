@@ -13,3 +13,5 @@ build/
 logs/
 tmp/
 *.log
+
+*.pid

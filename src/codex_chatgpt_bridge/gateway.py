@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import csv
+import fnmatch
+import io
+import json
+import os
+import platform
+import re
 import shutil
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,8 +31,11 @@ from .config import (
     TrustMode,
     add_grant,
     default_config_path,
+    load_config,
     save_config,
 )
+from .live_inbox import LiveInboxStore, default_inbox_path
+from .process_runner import BackgroundJobManager, ShellKind, kill_process_tree, run_argv_captured
 from .security import is_relative_to, is_sensitive_path, resolve_user_path
 
 SandboxMode = Literal["read_only", "workspace_write"]
@@ -36,6 +48,28 @@ DelegatePermissionLevel = Literal[
     "gui_control",
     "full_local",
 ]
+ProcessAction = Literal[
+    "list_jobs",
+    "job_status",
+    "kill_job",
+    "send_input",
+    "clear_finished",
+    "system_processes",
+    "kill_pid",
+    "restart_bridge",
+]
+FileOpAction = Literal[
+    "stat",
+    "mkdir",
+    "delete",
+    "move",
+    "copy",
+    "read_lines",
+    "head",
+    "tail",
+]
+EditMode = Literal["replace", "replace_lines", "append", "prepend"]
+
 JsonObject = dict[str, Any]
 DELEGATE_PERMISSION_LEVELS: set[str] = {
     "read_only",
@@ -58,6 +92,61 @@ SANDBOX_RANK: dict[str, int] = {
     "workspace_write": 1,
     "danger_full_access": 2,
 }
+_IGNORED_SEARCH_DIRS: set[str] = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "target",
+}
+_BINARY_EXTENSIONS: set[str] = {
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".obj",
+    ".o",
+    ".a",
+    ".lib",
+    ".pdb",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".rar",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".bmp",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".ogg",
+    ".avi",
+    ".mov",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".pyc",
+    ".pyo",
+    ".vpk",
+    ".bsp",
+}
+_LINE_RANGE_RE = re.compile(r"^(?P<path>.+?)#L(?P<start>\d+)(?:-L?(?P<end>\d+))?$")
 
 
 class BridgeError(RuntimeError):
@@ -76,19 +165,49 @@ class LocalGateway:
     ) -> None:
         self._config = config
         self._config_path = config_path or default_config_path()
+        self._has_explicit_config_path = config_path is not None
+        self._config_mtime_ns = self._get_config_mtime_ns()
         self._session_store = CodexSessionStore(
             session_store_path or default_session_store_path(self._config_path)
         )
+        self._inbox_store = LiveInboxStore(default_inbox_path(self._config_path))
+        self._job_manager = BackgroundJobManager(max_buffer_chars=400_000)
+
+    def _get_config_mtime_ns(self) -> int | None:
+        if not self._has_explicit_config_path:
+            return None
+        with contextlib.suppress(OSError):
+            if self._config_path.exists():
+                return self._config_path.stat().st_mtime_ns
+        return None
+
+    def _maybe_reload_config(self) -> None:
+        if not self._has_explicit_config_path:
+            return
+        current_mtime = self._get_config_mtime_ns()
+        if current_mtime is not None and current_mtime != self._config_mtime_ns:
+            with contextlib.suppress(Exception):
+                reloaded = load_config(self._config_path)
+                # Keep active connector_secret and auth_token in memory so active tunnels never 401
+                self._config = reloaded.model_copy(
+                    update={
+                        "auth_token": self._config.auth_token,
+                        "connector_secret": self._config.connector_secret,
+                    }
+                )
+                self._config_mtime_ns = current_mtime
 
     @property
     def config(self) -> BridgeConfig:
-        """Return runtime config."""
+        """Return runtime config (auto-reloading if modified on disk)."""
 
+        self._maybe_reload_config()
         return self._config
 
     async def bridge_status(self) -> JsonObject:
-        """Return basic bridge status without leaking file contents."""
+        """Return bridge status and capabilities."""
 
+        self._maybe_reload_config()
         return {
             "status": "ok",
             "host": self._config.host,
@@ -98,8 +217,40 @@ class LocalGateway:
             "grant_count": len(self._config.grants),
             "auth_required": True,
             "codex_tasks_enabled": self._config.enable_codex_tasks,
+            "active_background_jobs": sum(
+                1 for job in self._job_manager.list_jobs() if job["status"] == "running"
+            ),
+            "unread_user_messages": len(self._inbox_store.peek_unread_for_agent()),
+            "live_inbox_enabled": True,
+            "bridge_chat_channel": "active (consola interactiva 'bridge chat' conectada a live_inbox.json)",
+            "ripgrep_available": shutil.which("rg") is not None,
+            "search_engine": "ripgrep" if shutil.which("rg") else "python_native",
             "tools": self._visible_tool_names(),
         }
+
+    def inbox_send_user_message(self, text: str, *, priority: str = "normal") -> JsonObject:
+        """Queue a live message from the user without interrupting the agent work loop."""
+        return self._inbox_store.send_user_message(text, priority=priority)
+
+    def inbox_send_agent_reply(self, text: str) -> JsonObject:
+        """Send a live reply or progress update from the agent to the local Bridge Messenger UI."""
+        return self._inbox_store.send_agent_reply(text)
+
+    def inbox_pop_unread(self, *, tool_name: str) -> list[JsonObject]:
+        """Pop unread user messages and attach them to the current tool response."""
+        return self._inbox_store.pop_unread_for_agent(tool_name=tool_name)
+
+    def inbox_record_activity(self, tool_name: str, summary: str = "") -> None:
+        """Record the agent's latest tool call for live UI telemetry."""
+        self._inbox_store.record_agent_activity(tool_name, summary)
+
+    def inbox_state(self, *, limit: int = 50) -> JsonObject:
+        """Return live inbox messages and agent telemetry."""
+        return self._inbox_store.get_state(limit=limit)
+
+    def inbox_clear(self) -> JsonObject:
+        """Clear all live inbox messages."""
+        return self._inbox_store.clear()
 
     def _visible_tool_names(self) -> list[str]:
         if self._config.tool_profile == "delegate":
@@ -124,6 +275,12 @@ class LocalGateway:
             "search_files",
             "read_file",
             "write_file",
+            "list_dir",
+            "edit_file",
+            "file_ops",
+            "exec_command",
+            "process_manager",
+            "system_info",
             *(["codex_task_run"] if self._config.enable_codex_tasks else []),
             *(
                 [
@@ -141,6 +298,7 @@ class LocalGateway:
     async def list_grants(self) -> JsonObject:
         """List configured grants."""
 
+        self._maybe_reload_config()
         return {
             "trust_mode": self._config.trust_mode,
             "full_delegate": self._config.trust_mode == "full_delegate",
@@ -211,16 +369,54 @@ class LocalGateway:
         self._save_runtime_config()
         return {"path": str(resolved), "removed": len(grants) < before}
 
-    async def read_file(self, *, path: str, max_chars: int | None = None) -> JsonObject:
-        """Read an approved UTF-8 file."""
+    async def read_file(
+        self,
+        *,
+        path: str,
+        max_chars: int | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> JsonObject:
+        """Read an approved UTF-8 file (or directory listing / power shortcut in full_delegate)."""
 
-        resolved = self._authorize(path, read=True)
+        self._maybe_reload_config()
+        shortcut_result = await self._handle_read_shortcut(path)
+        if shortcut_result is not None:
+            return shortcut_result
+
+        raw_path = path
+        match = _LINE_RANGE_RE.match(raw_path)
+        if match and start_line is None and end_line is None:
+            raw_path = match.group("path")
+            start_line = int(match.group("start"))
+            end_line = int(match.group("end")) if match.group("end") else start_line + 200
+
+        resolved = self._authorize(raw_path, read=True)
         limit = max_chars or self._config.max_file_chars
         if limit <= 0 or limit > self._config.max_file_chars:
             raise BridgeError(f"max_chars must be between 1 and {self._config.max_file_chars}")
-        if not resolved.exists() or not resolved.is_file():
+        if not resolved.exists():
             raise BridgeError(f"file does not exist: {resolved}")
+        if resolved.is_dir():
+            listing = await self.list_dir(path=str(resolved))
+            formatted = json.dumps(listing, ensure_ascii=False, indent=2)
+            return {
+                "path": str(resolved),
+                "is_directory": True,
+                "text": formatted[:limit],
+                "truncated": len(formatted) > limit,
+                "chars": min(len(formatted), limit),
+            }
+        if not resolved.is_file():
+            raise BridgeError(f"file does not exist: {resolved}")
+
         text = await asyncio.to_thread(resolved.read_text, encoding="utf-8", errors="replace")
+        if start_line is not None or end_line is not None:
+            lines = text.splitlines(keepends=True)
+            s_idx = max(0, (start_line or 1) - 1)
+            e_idx = min(len(lines), end_line or len(lines))
+            text = "".join(lines[s_idx:e_idx])
+
         truncated = len(text) > limit
         return {
             "path": str(resolved),
@@ -229,6 +425,111 @@ class LocalGateway:
             "chars": min(len(text), limit),
         }
 
+    async def _handle_read_shortcut(self, raw_path: str) -> JsonObject | None:
+        """Support multiplexed prefixes (ps:, cmd:, py:, exec:, bg:, jobs:, inbox:) via read_file."""
+
+        if raw_path.startswith("inbox:"):
+            spec = raw_path[6:].strip()
+            if not spec or spec == "check" or spec == "pop":
+                popped = self.inbox_pop_unread(tool_name="read_file(inbox:)")
+                state = self.inbox_state()
+                res: JsonObject = {"popped_messages": popped, "inbox": state}
+            elif spec in {"peek", "history", "list", "status"}:
+                res = self.inbox_state()
+            elif spec == "clear":
+                res = self.inbox_clear()
+            elif spec.startswith("reply:"):
+                reply_text = spec[6:].strip()
+                res = {"sent_reply": self.inbox_send_agent_reply(reply_text)}
+            elif spec.startswith("send:"):
+                user_text = spec[5:].strip()
+                res = {"queued_user_message": self.inbox_send_user_message(user_text)}
+            else:
+                res = {"sent_reply": self.inbox_send_agent_reply(spec)}
+            text_out = json.dumps(res, ensure_ascii=False, indent=2)
+            return {
+                "path": raw_path,
+                "text": text_out,
+                "truncated": False,
+                "chars": len(text_out),
+            }
+
+        if self._config.trust_mode != "full_delegate":
+            return None
+
+        prefixes: tuple[tuple[str, str], ...] = (
+            ("ps:", "powershell"),
+            ("powershell:", "powershell"),
+            ("cmd:", "cmd"),
+            ("py:", "python"),
+            ("python:", "python"),
+            ("exec:", "auto"),
+            ("sh:", "sh"),
+        )
+        for prefix, shell_kind in prefixes:
+            if raw_path.startswith(prefix):
+                cmd_text = raw_path[len(prefix) :].strip()
+                res = await self.exec_command(command=cmd_text, shell=shell_kind)  # type: ignore[arg-type]
+                text_out = json.dumps(res, ensure_ascii=False, indent=2)
+                return {
+                    "path": raw_path,
+                    "text": text_out,
+                    "truncated": False,
+                    "chars": len(text_out),
+                }
+
+        if raw_path.startswith("bg:"):
+            cmd_text = raw_path[3:].strip()
+            res = await self.exec_command(command=cmd_text, background=True)
+            text_out = json.dumps(res, ensure_ascii=False, indent=2)
+            return {
+                "path": raw_path,
+                "text": text_out,
+                "truncated": False,
+                "chars": len(text_out),
+            }
+
+        if raw_path.startswith("jobs:"):
+            spec = raw_path[5:].strip()
+            if not spec or spec == "list":
+                res = await self.process_manager(action="list_jobs")
+            elif spec.startswith("wait:"):
+                jid = spec.split(":", 1)[1].strip()
+                res = {"job": await self._job_manager.wait_for_job(jid, timeout_s=20.0)}
+            elif spec.startswith("status:"):
+                jid = spec.split(":", 1)[1].strip()
+                res = {"job": await self._job_manager.wait_for_job(jid, timeout_s=15.0)}
+            elif spec.startswith("kill:"):
+                res = await self.process_manager(
+                    action="kill_job",
+                    job_id=spec.split(":", 1)[1].strip(),
+                )
+            elif spec.startswith("ps"):
+                parts = spec.split(":", 1)
+                flt = parts[1].strip() if len(parts) > 1 else None
+                res = await self.process_manager(action="system_processes", filter_name=flt)
+            else:
+                res = {"job": await self._job_manager.wait_for_job(spec, timeout_s=15.0)}
+            text_out = json.dumps(res, ensure_ascii=False, indent=2)
+            return {
+                "path": raw_path,
+                "text": text_out,
+                "truncated": False,
+                "chars": len(text_out),
+            }
+
+        if raw_path.startswith("sysinfo:"):
+            res = await self.system_info()
+            text_out = json.dumps(res, ensure_ascii=False, indent=2)
+            return {
+                "path": raw_path,
+                "text": text_out,
+                "truncated": False,
+                "chars": len(text_out),
+            }
+
+        return None
+
     async def write_file(
         self,
         *,
@@ -236,7 +537,12 @@ class LocalGateway:
         content: str,
         create_parents: bool = False,
     ) -> JsonObject:
-        """Write UTF-8 text to an approved path."""
+        """Write UTF-8 text to an approved path (or run surgical edit via edit:<path>)."""
+
+        self._maybe_reload_config()
+        if path.startswith("edit:"):
+            target_path = path[5:].strip()
+            return await self._apply_inline_edit_block(target_path, content)
 
         if len(content) > self._config.max_write_chars:
             raise BridgeError(f"content exceeds max_write_chars={self._config.max_write_chars}")
@@ -245,8 +551,590 @@ class LocalGateway:
             await asyncio.to_thread(resolved.parent.mkdir, parents=True, exist_ok=True)
         if not resolved.parent.exists():
             raise BridgeError(f"parent directory does not exist: {resolved.parent}")
+        if resolved.name.lower() in {"agent_outbox.txt", "bridge_chat.txt"} and content.strip():
+            with contextlib.suppress(OSError):
+                resolved.unlink(missing_ok=True)
+            msg = self.inbox_send_agent_reply(content.strip())
+            return {"path": str(resolved), "bytes": len(content.encode("utf-8")), "bridge_chat_delivered": msg}
         await asyncio.to_thread(resolved.write_text, content, encoding="utf-8")
+        if resolved.name.lower() == "run_task.py" and content.strip():
+            job = await self._job_manager.start_job(
+                command=content,
+                cwd=resolved.parent,
+                shell="python",
+                allow_stdin=False,
+            )
+            waited_res = await self._job_manager.wait_for_job(job.job_id, timeout_s=18.0)
+            return {"path": str(resolved), "bytes": len(content.encode("utf-8")), "job": waited_res}
         return {"path": str(resolved), "bytes": len(content.encode("utf-8"))}
+
+    async def _apply_inline_edit_block(self, path: str, content: str) -> JsonObject:
+        if "<<<OLD\n" in content and "\n===\n" in content and "\n>>>" in content:
+            body = content.split("<<<OLD\n", 1)[1]
+            old_part, rest = body.split("\n===\n", 1)
+            new_part = rest.rsplit("\n>>>", 1)[0]
+            return await self.edit_file(path=path, old_text=old_part, new_text=new_part)
+        raise BridgeError("inline edit:<path> requires <<<OLD\\n...\\n===\\n...\\n>>> format")
+
+    async def edit_file(
+        self,
+        *,
+        path: str,
+        old_text: str | None = None,
+        new_text: str = "",
+        replace_all: bool = False,
+        mode: EditMode = "replace",
+        start_line: int | None = None,
+        end_line: int | None = None,
+        create_if_missing: bool = False,
+    ) -> JsonObject:
+        """Perform fast surgical edits on a local file without rewriting the whole file over MCP."""
+
+        self._maybe_reload_config()
+        resolved = self._authorize(path, read=True, write=True)
+        if not resolved.exists():
+            if create_if_missing:
+                await asyncio.to_thread(resolved.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(resolved.write_text, new_text, encoding="utf-8")
+                return {
+                    "path": str(resolved),
+                    "mode": "created",
+                    "replacements": 1,
+                    "bytes": len(new_text.encode("utf-8")),
+                }
+            raise BridgeError(f"file does not exist: {resolved}")
+
+        raw_bytes = await asyncio.to_thread(resolved.read_bytes)
+        uses_crlf = b"\r\n" in raw_bytes
+        current_text = raw_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        normalized_new = new_text.replace("\r\n", "\n")
+
+        if mode == "append":
+            updated_text = current_text + normalized_new
+            replacements = 1
+        elif mode == "prepend":
+            updated_text = normalized_new + current_text
+            replacements = 1
+        elif mode == "replace_lines":
+            if start_line is None or start_line < 1:
+                raise BridgeError("start_line (>= 1) is required for mode='replace_lines'")
+            lines = current_text.splitlines(keepends=True)
+            s_idx = start_line - 1
+            e_idx = end_line if end_line is not None else start_line
+            if s_idx > len(lines):
+                raise BridgeError(f"start_line={start_line} exceeds file length ({len(lines)})")
+            replacement_lines = (
+                [normalized_new]
+                if normalized_new.endswith("\n") or not normalized_new
+                else [f"{normalized_new}\n"]
+            )
+            lines[s_idx:e_idx] = replacement_lines if normalized_new else []
+            updated_text = "".join(lines)
+            replacements = 1
+        elif mode == "replace":
+            if old_text is None or old_text == "":
+                raise BridgeError("old_text must be provided for mode='replace'")
+            normalized_old = old_text.replace("\r\n", "\n")
+            count = current_text.count(normalized_old)
+            if count == 0:
+                raise BridgeError(f"old_text was not found in {resolved}")
+            if count > 1 and not replace_all:
+                raise BridgeError(
+                    f"old_text matched {count} locations in {resolved}; "
+                    "pass replace_all=True or include more surrounding context"
+                )
+            if replace_all:
+                updated_text = current_text.replace(normalized_old, normalized_new)
+                replacements = count
+            else:
+                updated_text = current_text.replace(normalized_old, normalized_new, 1)
+                replacements = 1
+        else:
+            raise BridgeError(f"unsupported edit mode: {mode}")
+
+        final_text = updated_text.replace("\n", "\r\n") if uses_crlf else updated_text
+        final_bytes = final_text.encode("utf-8")
+        await asyncio.to_thread(resolved.write_bytes, final_bytes)
+        with contextlib.suppress(Exception):
+            old_lines = (old_text or "").replace("\r\n", "\n").splitlines() if mode == "replace" else []
+            new_lines = normalized_new.splitlines()
+            diff_preview = [f"Added {len(new_lines)} lines, removed {len(old_lines)} lines"]
+            for ol in old_lines[:6]:
+                diff_preview.append(f"- {ol[:100]}")
+            if len(old_lines) > 6:
+                diff_preview.append(f"- ... ({len(old_lines) - 6} more lines)")
+            for nl in new_lines[:8]:
+                diff_preview.append(f"+ {nl[:100]}")
+            if len(new_lines) > 8:
+                diff_preview.append(f"+ ... ({len(new_lines) - 8} more lines)")
+            self._inbox_store.record_agent_activity("edit_file", str(resolved), "\n".join(diff_preview))
+        return {
+            "path": str(resolved),
+            "mode": mode,
+            "replacements": replacements,
+            "bytes": len(final_bytes),
+        }
+
+    async def list_dir(
+        self,
+        *,
+        path: str = "~",
+        recursive: bool = False,
+        max_depth: int = 2,
+        pattern: str | None = None,
+        include_hidden: bool = False,
+        max_entries: int = 200,
+    ) -> JsonObject:
+        """List files and subdirectories inside an approved directory."""
+
+        self._maybe_reload_config()
+        resolved = self._authorize(path, read=True)
+        if not resolved.exists():
+            raise BridgeError(f"directory does not exist: {resolved}")
+        if not resolved.is_dir():
+            raise BridgeError(f"path is not a directory: {resolved}")
+        capped_entries = max(1, min(max_entries, 1000))
+        entries, truncated = await asyncio.to_thread(
+            self._scan_directory_sync,
+            root=resolved,
+            recursive=recursive,
+            max_depth=max(1, min(max_depth, 10)),
+            pattern=pattern,
+            include_hidden=include_hidden,
+            max_entries=capped_entries,
+        )
+        return {
+            "path": str(resolved),
+            "entries": entries,
+            "count": len(entries),
+            "truncated": truncated,
+        }
+
+    def _scan_directory_sync(
+        self,
+        *,
+        root: Path,
+        recursive: bool,
+        max_depth: int,
+        pattern: str | None,
+        include_hidden: bool,
+        max_entries: int,
+    ) -> tuple[list[JsonObject], bool]:
+        entries: list[JsonObject] = []
+        truncated = False
+        enforce_sensitive = self._config.trust_mode != "full_delegate"
+
+        def _visit(current_dir: Path, depth: int) -> None:
+            nonlocal truncated
+            if len(entries) >= max_entries:
+                truncated = True
+                return
+            try:
+                with os.scandir(current_dir) as it:
+                    raw_items = list(it)
+            except OSError:
+                return
+
+            raw_items.sort(key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            for entry in raw_items:
+                if len(entries) >= max_entries:
+                    truncated = True
+                    return
+                name = entry.name
+                if not include_hidden and name.startswith("."):
+                    continue
+                entry_path = Path(entry.path)
+                if enforce_sensitive and is_sensitive_path(entry_path):
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if pattern and not fnmatch.fnmatch(name.lower(), pattern.lower()):
+                    if (
+                        is_dir
+                        and recursive
+                        and depth < max_depth
+                        and name not in _IGNORED_SEARCH_DIRS
+                    ):
+                        _visit(entry_path, depth + 1)
+                    continue
+                try:
+                    stat_res = entry.stat(follow_symlinks=False)
+                    size_bytes = 0 if is_dir else stat_res.st_size
+                    modified_at = datetime.fromtimestamp(stat_res.st_mtime, tz=UTC).isoformat()
+                except OSError:
+                    size_bytes = 0
+                    modified_at = None
+
+                entries.append(
+                    {
+                        "name": name,
+                        "path": str(entry_path),
+                        "type": "dir" if is_dir else "file",
+                        "size_bytes": size_bytes,
+                        "modified_at": modified_at,
+                    }
+                )
+                if is_dir and recursive and depth < max_depth and name not in _IGNORED_SEARCH_DIRS:
+                    _visit(entry_path, depth + 1)
+
+        _visit(root, 1)
+        return entries, truncated
+
+    async def file_ops(
+        self,
+        *,
+        action: FileOpAction,
+        path: str,
+        dest_path: str | None = None,
+        start_line: int = 1,
+        end_line: int = 200,
+        lines: int = 100,
+        recursive: bool = False,
+    ) -> JsonObject:
+        """Perform filesystem operations: stat, mkdir, delete, move, copy, read_lines."""
+
+        self._maybe_reload_config()
+        if action in {"stat", "read_lines", "head", "tail"}:
+            resolved = self._authorize(path, read=True)
+        else:
+            resolved = self._authorize(path, read=True, write=True)
+
+        if action == "stat":
+            if not resolved.exists():
+                return {"path": str(resolved), "exists": False}
+            st = await asyncio.to_thread(resolved.stat)
+            return {
+                "path": str(resolved),
+                "exists": True,
+                "type": "dir" if resolved.is_dir() else "file",
+                "size_bytes": st.st_size,
+                "created_at": datetime.fromtimestamp(st.st_ctime, tz=UTC).isoformat(),
+                "modified_at": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
+            }
+
+        if action == "mkdir":
+            await asyncio.to_thread(resolved.mkdir, parents=True, exist_ok=True)
+            return {"path": str(resolved), "created": True}
+
+        if action == "delete":
+            if not resolved.exists():
+                return {"path": str(resolved), "deleted": False, "reason": "not_found"}
+            if resolved.is_dir():
+                if not recursive:
+                    await asyncio.to_thread(resolved.rmdir)
+                else:
+                    await asyncio.to_thread(shutil.rmtree, resolved)
+            else:
+                await asyncio.to_thread(resolved.unlink)
+            return {"path": str(resolved), "deleted": True}
+
+        if action in {"move", "copy"}:
+            if not dest_path:
+                raise BridgeError(f"dest_path is required for action='{action}'")
+            resolved_dest = self._authorize(dest_path, write=True)
+            await asyncio.to_thread(resolved_dest.parent.mkdir, parents=True, exist_ok=True)
+            if action == "move":
+                await asyncio.to_thread(shutil.move, str(resolved), str(resolved_dest))
+            elif resolved.is_dir():
+                await asyncio.to_thread(
+                    shutil.copytree,
+                    resolved,
+                    resolved_dest,
+                    dirs_exist_ok=True,
+                )
+            else:
+                await asyncio.to_thread(shutil.copy2, resolved, resolved_dest)
+            return {"source": str(resolved), "dest": str(resolved_dest), "action": action}
+
+        if action in {"read_lines", "head", "tail"}:
+            if not resolved.exists() or not resolved.is_file():
+                raise BridgeError(f"file does not exist: {resolved}")
+            text = await asyncio.to_thread(resolved.read_text, encoding="utf-8", errors="replace")
+            all_lines = text.splitlines()
+            total_lines = len(all_lines)
+            if action == "head":
+                selected = all_lines[: max(1, lines)]
+                s_num = 1
+            elif action == "tail":
+                count = max(1, lines)
+                selected = all_lines[-count:]
+                s_num = max(1, total_lines - len(selected) + 1)
+            else:
+                s_idx = max(0, start_line - 1)
+                e_idx = min(total_lines, max(start_line, end_line))
+                selected = all_lines[s_idx:e_idx]
+                s_num = s_idx + 1
+            numbered = "\n".join(f"{s_num + idx}: {line}" for idx, line in enumerate(selected))
+            return {
+                "path": str(resolved),
+                "total_lines": total_lines,
+                "start_line": s_num,
+                "returned_lines": len(selected),
+                "text": numbered,
+            }
+
+        raise BridgeError(f"unsupported file_ops action: {action}")
+
+    async def exec_command(
+        self,
+        *,
+        command: str,
+        cwd: str | None = None,
+        shell: ShellKind = "auto",
+        timeout_s: float = 30.0,
+        background: bool = False,
+        auto_background_on_timeout: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> JsonObject:
+        """Execute a direct shell/PowerShell/CMD/Python command without stalling."""
+
+        self._maybe_reload_config()
+        if not command or not command.strip():
+            raise BridgeError("command must not be empty")
+        if timeout_s <= 0 or timeout_s > 600:
+            raise BridgeError("timeout_s must be between 0 and 600 seconds")
+
+        target_cwd = cwd or (
+            str(self._config.grants[0].resolved_path)
+            if self._config.grants and self._config.trust_mode != "full_delegate"
+            else str(Path.home())
+        )
+        resolved_cwd = self._authorize(target_cwd, read=True, execute=True)
+        if not resolved_cwd.exists() or not resolved_cwd.is_dir():
+            resolved_cwd = Path.home()
+
+        return await self._job_manager.run_command(
+            command=command,
+            cwd=resolved_cwd,
+            shell=shell,
+            timeout_s=timeout_s,
+            background=background,
+            auto_background_on_timeout=auto_background_on_timeout,
+            env=env,
+        )
+
+    async def process_manager(
+        self,
+        *,
+        action: ProcessAction = "list_jobs",
+        job_id: str | None = None,
+        pid: int | None = None,
+        input_text: str | None = None,
+        filter_name: str | None = None,
+        tail_chars: int = 16_000,
+    ) -> JsonObject:
+        """Inspect or control background jobs and OS processes."""
+
+        self._maybe_reload_config()
+        if self._config.trust_mode != "full_delegate" and not any(
+            g.execute for g in self._config.grants
+        ):
+            raise BridgeError("execute permission or full_delegate mode is required")
+
+        if action == "list_jobs":
+            return {"jobs": self._job_manager.list_jobs()}
+
+        if action == "job_status":
+            target_id = job_id or "latest"
+            try:
+                job = self._job_manager.get_job(target_id)
+            except KeyError as exc:
+                raise BridgeError(str(exc)) from exc
+            return {"job": job.to_dict(include_output=True, tail_chars=tail_chars)}
+
+        if action == "kill_job":
+            if not job_id:
+                raise BridgeError("job_id is required for action='kill_job'")
+            try:
+                killed = await self._job_manager.kill_job(job_id)
+            except KeyError as exc:
+                raise BridgeError(str(exc)) from exc
+            return {"job": killed}
+
+        if action == "send_input":
+            if not job_id or input_text is None:
+                raise BridgeError("job_id and input_text are required for action='send_input'")
+            try:
+                updated = await self._job_manager.send_input(job_id, input_text)
+            except (KeyError, RuntimeError) as exc:
+                raise BridgeError(str(exc)) from exc
+            return {"job": updated}
+
+        if action == "clear_finished":
+            removed = self._job_manager.clear_finished()
+            return {"cleared_jobs": removed}
+
+        if action == "kill_pid":
+            if pid is None or pid <= 0:
+                raise BridgeError("pid (> 0) is required for action='kill_pid'")
+            await kill_process_tree(pid)
+            return {"pid": pid, "killed": True}
+
+        if action == "system_processes":
+            processes = await self._list_system_processes(filter_name=filter_name)
+            return {"processes": processes, "count": len(processes)}
+
+        if action == "restart_bridge":
+            return await self._schedule_self_restart()
+
+        raise BridgeError(f"unsupported process_manager action: {action}")
+
+    async def _schedule_self_restart(self) -> JsonObject:
+        """Spawn a detached watchdog to restart the bridge process after returning HTTP 200."""
+
+        import subprocess
+
+        current_pid = os.getpid()
+        bridge_ps1 = Path.home() / "bin" / "bridge.ps1"
+        repo_restart_ps1 = Path.home() / "codex-chatgpt-bridge-clean" / "restart-bridge.ps1"
+        if bridge_ps1.exists():
+            cmd = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(bridge_ps1),
+                "self-restart",
+                "-DelayMs",
+                "500",
+            ]
+        else:
+            cmd = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Start-Sleep -Milliseconds 500; & '{repo_restart_ps1}'",
+            ]
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags if os.name == "nt" else 0,
+            close_fds=True,
+            start_new_session=(os.name != "nt"),
+        )
+        return {
+            "status": "restarting",
+            "old_pid": current_pid,
+            "delay_ms": 500,
+            "message": (
+                "Detached self-restart scheduled. The bridge will replace PID "
+                f"{current_pid} and be back online on port 8766 in ~1.5 seconds."
+            ),
+        }
+
+    async def _list_system_processes(self, *, filter_name: str | None = None) -> list[JsonObject]:
+        if os.name == "nt":
+            _, stdout, _ = await run_argv_captured(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                cwd=Path.home(),
+                timeout_s=10.0,
+            )
+            items: list[JsonObject] = []
+            reader = csv.reader(io.StringIO(stdout))
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                name, pid_str, session_name, session_num, mem_usage = row[:5]
+                if filter_name and filter_name.lower() not in name.lower():
+                    continue
+                with contextlib.suppress(ValueError):
+                    items.append(
+                        {
+                            "name": name,
+                            "pid": int(pid_str),
+                            "session": session_name,
+                            "session_num": session_num,
+                            "memory": mem_usage.strip(),
+                        }
+                    )
+            return items[:200]
+
+        _, stdout, _ = await run_argv_captured(
+            ["ps", "-eo", "pid,comm,args"],
+            cwd=Path.home(),
+            timeout_s=10.0,
+        )
+        items = []
+        for line in stdout.splitlines()[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 2:
+                continue
+            pid_str, comm = parts[0], parts[1]
+            args = parts[2] if len(parts) > 2 else comm
+            if filter_name and filter_name.lower() not in line.lower():
+                continue
+            with contextlib.suppress(ValueError):
+                items.append({"pid": int(pid_str), "name": comm, "command": args[:300]})
+        return items[:200]
+
+    async def system_info(self) -> JsonObject:
+        """Return hardware, OS, disk usage, and environment diagnostics."""
+
+        self._maybe_reload_config()
+        drives: list[JsonObject] = []
+        if os.name == "nt":
+            for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+                drive_root = Path(f"{letter}:\\")
+                if drive_root.exists():
+                    with contextlib.suppress(OSError):
+                        usage = shutil.disk_usage(drive_root)
+                        drives.append(
+                            {
+                                "drive": f"{letter}:\\",
+                                "total_gb": round(usage.total / (1024**3), 2),
+                                "used_gb": round(usage.used / (1024**3), 2),
+                                "free_gb": round(usage.free / (1024**3), 2),
+                            }
+                        )
+        else:
+            with contextlib.suppress(OSError):
+                usage = shutil.disk_usage("/")
+                drives.append(
+                    {
+                        "drive": "/",
+                        "total_gb": round(usage.total / (1024**3), 2),
+                        "used_gb": round(usage.used / (1024**3), 2),
+                        "free_gb": round(usage.free / (1024**3), 2),
+                    }
+                )
+
+        return {
+            "os": os.name,
+            "platform": platform.platform(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "hostname": platform.node(),
+            "cpu_count": os.cpu_count(),
+            "python_executable": sys.executable,
+            "python_version": sys.version.split()[0],
+            "user_home": str(Path.home()),
+            "drives": drives,
+            "binaries": {
+                "codex": shutil.which("codex"),
+                "rg": shutil.which("rg"),
+                "git": shutil.which("git"),
+                "node": shutil.which("node"),
+                "npm": shutil.which("npm"),
+                "python": shutil.which("python"),
+                "powershell": shutil.which("pwsh") or shutil.which("powershell"),
+                "cloudflared": shutil.which("cloudflared"),
+            },
+            "bridge": await self.bridge_status(),
+        }
 
     async def search_files(
         self,
@@ -255,29 +1143,48 @@ class LocalGateway:
         root: str | None = None,
         max_results: int = 50,
     ) -> JsonObject:
-        """Search approved readable grants with ripgrep."""
+        """Search approved readable directories with ripgrep or native Python fallback."""
 
+        self._maybe_reload_config()
         if not query.strip():
             raise BridgeError("query must not be empty")
         if max_results <= 0 or max_results > 200:
             raise BridgeError("max_results must be between 1 and 200")
-        if shutil.which("rg") is None:
-            raise BridgeError("ripgrep is required for search_files")
+
         roots = [self._authorize(root, read=True)] if root else self._readable_roots()
+        has_rg = shutil.which("rg") is not None
         matches: list[JsonObject] = []
         for search_root in roots:
             if not search_root.exists():
                 continue
-            matches.extend(
-                await self._run_rg(
-                    query=query,
-                    root=search_root,
-                    remaining=max_results - len(matches),
+            remaining = max_results - len(matches)
+            if remaining <= 0:
+                break
+            if has_rg:
+                matches.extend(
+                    await self._run_rg(
+                        query=query,
+                        root=search_root,
+                        remaining=remaining,
+                    )
                 )
-            )
+            else:
+                matches.extend(
+                    await asyncio.to_thread(
+                        self._python_search_files,
+                        query=query,
+                        root=search_root,
+                        remaining=remaining,
+                    )
+                )
             if len(matches) >= max_results:
                 break
-        return {"query": query, "matches": matches, "truncated": len(matches) >= max_results}
+        return {
+            "query": query,
+            "engine": "ripgrep" if has_rg else "python_native",
+            "matches": matches,
+            "truncated": len(matches) >= max_results,
+        }
 
     async def codex_session_start(
         self,
@@ -289,6 +1196,7 @@ class LocalGateway:
     ) -> JsonObject:
         """Start a persisted local Codex session and return its bridge handle."""
 
+        self._maybe_reload_config()
         if not self._config.enable_codex_tasks:
             raise BridgeError(
                 "codex session tools are disabled; enable codex tasks in the bridge config"
@@ -334,6 +1242,7 @@ class LocalGateway:
     ) -> JsonObject:
         """Delegate one whole local task to Codex through a single MCP call."""
 
+        self._maybe_reload_config()
         task_text = self._delegate_task_text(task=task, prompt=prompt)
         if permission_level not in DELEGATE_PERMISSION_LEVELS:
             raise BridgeError("permission_level must be a supported delegate permission level")
@@ -447,6 +1356,7 @@ class LocalGateway:
     ) -> JsonObject:
         """Continue a persisted local Codex session."""
 
+        self._maybe_reload_config()
         if not self._config.enable_codex_tasks:
             raise BridgeError(
                 "codex session tools are disabled; enable codex tasks in the bridge config"
@@ -509,6 +1419,7 @@ class LocalGateway:
     ) -> JsonObject:
         """Run a bounded local Codex task in an approved executable directory."""
 
+        self._maybe_reload_config()
         if not self._config.enable_codex_tasks:
             raise BridgeError(
                 "codex_task_run is disabled; enable it explicitly in the bridge config"
@@ -541,21 +1452,16 @@ class LocalGateway:
             str(output_path),
             prompt,
         ]
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=wait_timeout_s,
+            returncode, stdout, stderr = await run_argv_captured(
+                command,
+                cwd=resolved_cwd,
+                timeout_s=wait_timeout_s,
             )
         except TimeoutError as exc:
-            process.kill()
-            await process.communicate()
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
             raise BridgeError(f"codex task timed out after {wait_timeout_s} seconds") from exc
+
         final_message = ""
         if output_path.exists():
             final_message = await asyncio.to_thread(
@@ -567,10 +1473,10 @@ class LocalGateway:
         return {
             "cwd": str(resolved_cwd),
             "sandbox_mode": sandbox_mode,
-            "returncode": process.returncode,
+            "returncode": returncode,
             "final_message": final_message,
-            "stdout_tail": stdout_bytes.decode("utf-8", errors="replace")[-8000:],
-            "stderr_tail": stderr_bytes.decode("utf-8", errors="replace")[-8000:],
+            "stdout_tail": stdout[-8000:],
+            "stderr_tail": stderr[-8000:],
         }
 
     def _authorize_codex_cwd(self, cwd: str, sandbox_mode: CodexSessionSandboxMode) -> Path:
@@ -669,30 +1575,21 @@ class LocalGateway:
         wait_timeout_s: float,
         cwd: Path,
     ) -> tuple[int, str, str]:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(cwd),
-        )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=wait_timeout_s,
+            return await run_argv_captured(
+                command,
+                cwd=cwd,
+                timeout_s=wait_timeout_s,
             )
         except TimeoutError as exc:
-            process.kill()
-            await process.communicate()
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
             raise BridgeError(f"codex session timed out after {wait_timeout_s} seconds") from exc
-        return (
-            process.returncode or 0,
-            stdout_bytes.decode("utf-8", errors="replace"),
-            stderr_bytes.decode("utf-8", errors="replace"),
-        )
 
     def _readable_roots(self) -> list[Path]:
-        return [grant.resolved_path for grant in self._config.grants if grant.read]
+        roots = [grant.resolved_path for grant in self._config.grants if grant.read]
+        if not roots and self._config.trust_mode == "full_delegate":
+            return [Path.home()]
+        return roots
 
     def _authorize(
         self,
@@ -727,14 +1624,17 @@ class LocalGateway:
         return max(matches, key=lambda grant: len(grant.resolved_path.parts))
 
     def _save_runtime_config(self) -> None:
+        if not self._has_explicit_config_path:
+            return
         save_config(self._config, self._config_path)
+        self._config_mtime_ns = self._get_config_mtime_ns()
 
     async def _run_rg(self, *, query: str, root: Path, remaining: int) -> list[JsonObject]:
         command = [
             "rg",
+            "--json",
             "--line-number",
             "--column",
-            "--no-heading",
             "--color",
             "never",
             "--glob",
@@ -746,31 +1646,123 @@ class LocalGateway:
             query,
             str(root),
         ]
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_bytes, stderr_bytes = await process.communicate()
-        if process.returncode not in {0, 1}:
-            raise BridgeError(stderr_bytes.decode("utf-8", errors="replace")[-2000:])
+        try:
+            returncode, stdout, stderr = await run_argv_captured(
+                command,
+                cwd=root if root.is_dir() else root.parent,
+                timeout_s=15.0,
+            )
+        except TimeoutError as exc:
+            raise BridgeError("ripgrep search timed out after 15 seconds") from exc
+
+        if returncode not in {0, 1}:
+            raise BridgeError(stderr[-2000:])
+
+        enforce_sensitive = self._config.trust_mode != "full_delegate"
         matches: list[JsonObject] = []
-        for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
+        for line in stdout.splitlines():
             if len(matches) >= remaining:
                 break
-            parts = line.split(":", 3)
-            if len(parts) != 4:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            path, line_no, column, text = parts
-            candidate = Path(path).resolve(strict=False)
-            if is_sensitive_path(candidate):
+            if event.get("type") != "match":
                 continue
+            data = event.get("data") or {}
+            path_text = (data.get("path") or {}).get("text")
+            if not path_text:
+                continue
+            candidate = Path(path_text).resolve(strict=False)
+            if enforce_sensitive and is_sensitive_path(candidate):
+                continue
+            line_no = int(data.get("line_number") or 1)
+            submatches = data.get("submatches") or []
+            col = int(submatches[0].get("start", 0)) + 1 if submatches else 1
+            lines_obj = data.get("lines") or {}
+            text = str(lines_obj.get("text") or "").rstrip("\r\n")
             matches.append(
                 {
                     "path": str(candidate),
-                    "line": int(line_no),
-                    "column": int(column),
+                    "line": line_no,
+                    "column": col,
                     "text": text[:500],
                 }
             )
+        return matches
+
+    def _python_search_files(self, *, query: str, root: Path, remaining: int) -> list[JsonObject]:
+        """Fast pure-Python regex/text/filename search when ripgrep is not installed."""
+
+        enforce_sensitive = self._config.trust_mode != "full_delegate"
+        matches: list[JsonObject] = []
+        is_file_glob = query.startswith(("files:", "glob:"))
+        glob_pat = query.split(":", 1)[1].strip().lower() if is_file_glob else ""
+
+        pattern: re.Pattern[str] | None = None
+        if not is_file_glob:
+            try:
+                pattern = re.compile(query, re.IGNORECASE)
+            except re.error:
+                pattern = re.compile(re.escape(query), re.IGNORECASE)
+
+        if root.is_file():
+            files_to_check = [root]
+        else:
+            files_to_check = []
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if d not in _IGNORED_SEARCH_DIRS and not d.startswith(".git")
+                ]
+                for fname in filenames:
+                    files_to_check.append(Path(dirpath) / fname)
+                    if len(files_to_check) >= 15_000:
+                        break
+                if len(files_to_check) >= 15_000:
+                    break
+
+        for candidate in files_to_check:
+            if len(matches) >= remaining:
+                break
+            resolved_cand = candidate.resolve(strict=False)
+            if enforce_sensitive and is_sensitive_path(resolved_cand):
+                continue
+            if is_file_glob:
+                if not glob_pat or fnmatch.fnmatch(candidate.name.lower(), f"*{glob_pat}*"):
+                    matches.append(
+                        {
+                            "path": str(resolved_cand),
+                            "line": 1,
+                            "column": 1,
+                            "text": f"[file] {candidate.name}",
+                        }
+                    )
+                continue
+
+            if candidate.suffix.lower() in _BINARY_EXTENSIONS:
+                continue
+            try:
+                if candidate.stat().st_size > 4_000_000:
+                    continue
+                content = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            assert pattern is not None
+            for idx, line_text in enumerate(content.splitlines(), start=1):
+                m = pattern.search(line_text)
+                if m:
+                    matches.append(
+                        {
+                            "path": str(resolved_cand),
+                            "line": idx,
+                            "column": m.start() + 1,
+                            "text": line_text[:500],
+                        }
+                    )
+                    if len(matches) >= remaining:
+                        break
+
         return matches

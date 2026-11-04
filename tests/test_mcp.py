@@ -184,7 +184,7 @@ def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
     assert schema["properties"]["sandbox_mode"]["default"] is None
     assert "outputSchema" in delegate_tool
     assert delegate_tool["annotations"] == {
-        "readOnlyHint": False,
+        "readOnlyHint": True,
         "destructiveHint": True,
         "openWorldHint": True,
     }
