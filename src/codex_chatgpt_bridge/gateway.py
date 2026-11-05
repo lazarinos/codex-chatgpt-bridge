@@ -587,7 +587,27 @@ class LocalGateway:
             return
         except Exception:
             pass
-        raise BridgeError("failed to capture screenshot (Pillow ImageGrab unavailable)")
+        if os.name == "nt":
+            import subprocess
+
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                "$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                "$bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); "
+                "$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                "$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); "
+                f"$bmp.Save('{str(out_path).replace(chr(39), chr(39)*2)}', [System.Drawing.Imaging.ImageFormat]::Png); "
+                "$g.Dispose(); $bmp.Dispose()"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if res.returncode == 0 and out_path.exists():
+                return
+        raise BridgeError("failed to capture screenshot (Pillow ImageGrab and GDI fallback unavailable)")
 
     async def _read_image_payload(
         self,
