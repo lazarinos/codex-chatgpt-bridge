@@ -101,6 +101,7 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
         "list_grants": gateway.list_grants,
         "search_files": gateway.search_files,
         "read_file": gateway.read_file,
+        "view_image": gateway.view_image,
         "write_file": gateway.write_file,
         "list_dir": gateway.list_dir,
         "edit_file": gateway.edit_file,
@@ -131,7 +132,11 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     )
     gateway.inbox_record_activity(name, arg_preview)
     structured = await handler(**arguments)
+    mcp_image: JsonObject | None = None
     if isinstance(structured, dict):
+        maybe_img = structured.pop("_mcp_image", None)
+        if isinstance(maybe_img, dict) and "data" in maybe_img:
+            mcp_image = maybe_img
         structured["bridge_chat_console"] = "online"
         unread = gateway.inbox_pop_unread(tool_name=name)
         if unread:
@@ -147,9 +152,20 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
         completed_alerts = gateway._job_manager.pop_newly_completed_jobs()
         if completed_alerts:
             structured["completed_jobs_alert"] = completed_alerts
+    content_blocks: list[JsonObject] = [
+        {"type": "text", "text": json.dumps(structured, ensure_ascii=False, indent=2)}
+    ]
+    if mcp_image is not None:
+        content_blocks.append(
+            {
+                "type": "image",
+                "data": mcp_image["data"],
+                "mimeType": mcp_image.get("mimeType", "image/png"),
+            }
+        )
     return {
         "structuredContent": structured,
-        "content": [{"type": "text", "text": json.dumps(structured, ensure_ascii=False, indent=2)}],
+        "content": content_blocks,
     }
 
 
@@ -306,8 +322,8 @@ def tool_definitions(
             "description": (
                 "Read a UTF-8 text file (supports #L10-L50 line ranges or directory listing if "
                 "path is a folder). In full_delegate mode, also supports 'ps:<cmd>', 'cmd:<cmd>', "
-                "'py:<code>', 'bg:<cmd>', 'jobs:list', 'jobs:status:<id>', 'jobs:kill:<id>', and "
-                "'sysinfo:' shortcuts."
+                "'py:<code>', 'bg:<cmd>', 'jobs:list', 'jobs:status:<id>', 'jobs:kill:<id>', "
+                "'img:<path>', 'screenshot:', and 'sysinfo:' shortcuts."
             ),
             "inputSchema": {
                 "type": "object",
@@ -316,6 +332,30 @@ def tool_definitions(
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "default": None},
                     "start_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
                     "end_line": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        },
+        {
+            "name": "view_image",
+            "title": "View local image or capture live screenshot",
+            "description": (
+                "Read a local image file (.png, .jpg, .webp, .bmp) or pass path='screenshot' "
+                "to capture a live screen/game frame, returning native MCP ImageContent plus "
+                "visual dimensions and RGB statistics."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "max_width": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "maximum": 4096,
+                        "default": 1280,
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -570,6 +610,7 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
         "list_grants",
         "search_files",
         "read_file",
+        "view_image",
         "write_file",
         "list_dir",
         "edit_file",

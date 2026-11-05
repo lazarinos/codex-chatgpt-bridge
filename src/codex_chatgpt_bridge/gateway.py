@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import csv
 import fnmatch
 import io
 import json
+import mimetypes
 import os
 import platform
 import re
@@ -274,6 +276,7 @@ class LocalGateway:
             "list_grants",
             "search_files",
             "read_file",
+            "view_image",
             "write_file",
             "list_dir",
             "edit_file",
@@ -410,6 +413,13 @@ class LocalGateway:
         if not resolved.is_file():
             raise BridgeError(f"file does not exist: {resolved}")
 
+        if (
+            start_line is None
+            and end_line is None
+            and resolved.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+        ):
+            return await self._read_image_payload(resolved)
+
         text = await asyncio.to_thread(resolved.read_text, encoding="utf-8", errors="replace")
         if start_line is not None or end_line is not None:
             lines = text.splitlines(keepends=True)
@@ -528,7 +538,116 @@ class LocalGateway:
                 "chars": len(text_out),
             }
 
+        if raw_path.startswith(("img:", "image:")):
+            target = raw_path.split(":", 1)[1].strip()
+            return await self.view_image(path=target)
+
+        if raw_path.startswith("screenshot:"):
+            target = raw_path.split(":", 1)[1].strip() or "screenshot"
+            return await self.view_image(path=f"screenshot:{target}" if target != "screenshot" else "screenshot")
+
         return None
+
+    async def view_image(
+        self,
+        *,
+        path: str,
+        max_width: int = 1280,
+    ) -> JsonObject:
+        """Read a local image or capture a live desktop/game screenshot and return MCP ImageContent + visual metrics."""
+
+        self._maybe_reload_config()
+        spec = path.strip()
+        if spec.lower() in {"screenshot", "screen", "desktop"} or spec.lower().startswith("screenshot:"):
+            if self._config.trust_mode != "full_delegate":
+                raise BridgeError("live screenshot capture requires full_delegate trust_mode")
+            custom_out = spec.split(":", 1)[1].strip() if ":" in spec else ""
+            out_path = (
+                resolve_user_path(custom_out)
+                if custom_out
+                else Path(tempfile.gettempdir()) / "codex_bridge_screenshot.png"
+            )
+            await asyncio.to_thread(self._capture_screenshot_sync, out_path)
+            resolved = out_path
+        else:
+            resolved = self._authorize(spec, read=True)
+            if not resolved.exists() or not resolved.is_file():
+                raise BridgeError(f"image file does not exist: {resolved}")
+
+        return await self._read_image_payload(resolved, max_width=max_width)
+
+    @staticmethod
+    def _capture_screenshot_sync(out_path: Path) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from PIL import ImageGrab  # type: ignore[import-not-found]
+
+            img = ImageGrab.grab(all_screens=False)
+            img.save(out_path, format="PNG")
+            return
+        except Exception:
+            pass
+        raise BridgeError("failed to capture screenshot (Pillow ImageGrab unavailable)")
+
+    async def _read_image_payload(
+        self,
+        resolved: Path,
+        *,
+        max_width: int = 1280,
+    ) -> JsonObject:
+        def _load_sync() -> JsonObject:
+            raw_bytes = resolved.read_bytes()
+            mime_type = mimetypes.guess_type(str(resolved))[0] or "image/png"
+            width: int | None = None
+            height: int | None = None
+            mode_str: str | None = None
+            mean_rgb: list[float] | None = None
+            out_bytes = raw_bytes
+            try:
+                from PIL import Image, ImageStat  # type: ignore[import-not-found]
+
+                with Image.open(io.BytesIO(raw_bytes)) as im:
+                    width, height = im.size
+                    mode_str = im.mode
+                    rgb_im = im.convert("RGB")
+                    stat = ImageStat.Stat(rgb_im)
+                    mean_rgb = [round(float(x), 2) for x in stat.mean[:3]]
+                    if max_width > 0 and width > max_width:
+                        new_h = max(1, int(round(height * (max_width / float(width)))))
+                        resized = rgb_im.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                        buf = io.BytesIO()
+                        resized.save(buf, format="JPEG", quality=85)
+                        out_bytes = buf.getvalue()
+                        mime_type = "image/jpeg"
+                        width, height = resized.size
+            except Exception:
+                pass
+
+            b64_data = base64.b64encode(out_bytes).decode("ascii")
+            summary = {
+                "path": str(resolved),
+                "is_image": True,
+                "mime_type": mime_type,
+                "bytes": len(raw_bytes),
+                "encoded_bytes": len(out_bytes),
+                "width": width,
+                "height": height,
+                "mode": mode_str,
+                "mean_rgb": mean_rgb,
+            }
+            text_summary = json.dumps(summary, ensure_ascii=False, indent=2)
+            return {
+                **summary,
+                "text": text_summary,
+                "truncated": False,
+                "chars": len(text_summary),
+                "_mcp_image": {
+                    "data": b64_data,
+                    "mimeType": mime_type,
+                },
+            }
+
+        return await asyncio.to_thread(_load_sync)
 
     async def write_file(
         self,

@@ -366,3 +366,36 @@ def test_tools_call_grant_path_defaults_to_read_only(tmp_path: Path) -> None:
     assert grant["read"] is True
     assert grant["write"] is False
     assert grant["execute"] is False
+
+
+def test_tools_call_view_image_returns_mcp_image_content(tmp_path: Path) -> None:
+    import base64
+
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    img_path = tmp_path / "sample.png"
+    img_path.write_bytes(png_1x1)
+    config = BridgeConfig(auth_token="test-token", grants=[BridgeGrant(path=tmp_path)])
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "view_image", "arguments": {"path": str(img_path)}},
+        },
+    )
+
+    assert response.status_code == 200
+    res = response.json()["result"]
+    assert res["structuredContent"]["is_image"] is True
+    assert "_mcp_image" not in res["structuredContent"]
+    assert len(res["content"]) == 2
+    assert res["content"][1]["type"] == "image"
+    assert res["content"][1]["mimeType"] == "image/png"
+    assert len(res["content"][1]["data"]) > 10
