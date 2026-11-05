@@ -632,16 +632,56 @@ class LocalGateway:
                     rgb_im = im.convert("RGB")
                     stat = ImageStat.Stat(rgb_im)
                     mean_rgb = [round(float(x), 2) for x in stat.mean[:3]]
-                    if max_width > 0 and width > max_width:
-                        new_h = max(1, int(round(height * (max_width / float(width)))))
-                        resized = rgb_im.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                    if (max_width > 0 and width > max_width) or len(raw_bytes) > 90_000:
+                        target_w = min(width, max_width) if max_width > 0 else width
+                        new_h = max(1, int(round(height * (target_w / float(width)))))
+                        resized = (
+                            rgb_im.resize((target_w, new_h), Image.Resampling.LANCZOS)
+                            if target_w != width
+                            else rgb_im
+                        )
                         buf = io.BytesIO()
-                        resized.save(buf, format="JPEG", quality=85)
+                        resized.save(buf, format="JPEG", quality=82, optimize=True)
                         out_bytes = buf.getvalue()
                         mime_type = "image/jpeg"
                         width, height = resized.size
             except Exception:
-                pass
+                if os.name == "nt" and len(out_bytes) > 90_000:
+                    with contextlib.suppress(Exception):
+                        import subprocess
+                        tmp_jpg = Path(tempfile.gettempdir()) / "codex_bridge_opt.jpg"
+                        src_esc = str(resolved).replace("'", "''")
+                        dst_esc = str(tmp_jpg).replace("'", "''")
+                        tw = max_width if max_width > 0 else 1280
+                        ps_opt = (
+                            "Add-Type -AssemblyName System.Drawing; "
+                            f"$img = [System.Drawing.Image]::FromFile('{src_esc}'); "
+                            f"$w = $img.Width; $h = $img.Height; $tw = [Math]::Min($w, {tw}); "
+                            "$th = [Math]::Max(1, [int][Math]::Round($h * ($tw / [double]$w))); "
+                            "$bmp = New-Object System.Drawing.Bitmap($tw, $th); "
+                            "$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                            "$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; "
+                            "$g.DrawImage($img, 0, 0, $tw, $th); "
+                            "$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }; "
+                            "$ep = New-Object System.Drawing.Imaging.EncoderParameters(1); "
+                            "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]82); "
+                            f"$bmp.Save('{dst_esc}', $enc, $ep); "
+                            "Write-Output \"$tw,$th\"; "
+                            "$g.Dispose(); $bmp.Dispose(); $img.Dispose()"
+                        )
+                        r = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command", ps_opt],
+                            capture_output=True,
+                            text=True,
+                            timeout=8,
+                            check=False,
+                        )
+                        if r.returncode == 0 and tmp_jpg.exists():
+                            out_bytes = tmp_jpg.read_bytes()
+                            mime_type = "image/jpeg"
+                            dims = r.stdout.strip().split(",")
+                            if len(dims) == 2:
+                                width, height = int(dims[0]), int(dims[1])
 
             b64_data = base64.b64encode(out_bytes).decode("ascii")
             summary = {
