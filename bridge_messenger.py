@@ -173,31 +173,32 @@ class ActivityConsolidator:
         self._lock = threading.Lock()
         self._last_push_time = 0.0
 
-    def is_inspection(self, tool_name: str) -> bool:
-        return tool_name in self.INSPECTION_TOOLS
+    def is_inspection(self, tool_name: str, summary: str = "") -> bool:
+        if tool_name not in self.INSPECTION_TOOLS:
+            return False
+        clean = (summary or "").strip().lower()
+        if clean.startswith(("ps:", "cmd:", "py:", "powershell:", "python:", "exec:", "sh:", "bg:", "jobs:", "inbox:")):
+            return False
+        return True
 
     def push(self, tool_name: str, summary: str, timestamp: str, details: str = "") -> None:
         with self._lock:
-            if self.is_inspection(tool_name) and not details:
-                # Accumulate consecutive read-only inspections
+            if self.is_inspection(tool_name, summary) and not details:
                 clean_target = summary.strip()
-                if clean_target.startswith(("ps:", "cmd:", "py:")):
-                    clean_target = clean_target[3:].strip()
                 self._pending_inspections.append(InspectionItem(tool=tool_name, target=clean_target, timestamp=timestamp))
                 self._last_push_time = time.time()
                 return
 
-            # Significant tool (bash, edit, write, or inspection with details): flush pending reads first
+            # Significant tool (bash, commands, edit, write, or inspection with details): flush pending reads first
             self._flush_locked()
-            # Render the significant action immediately
             block = TuiRenderer.format_tool_call(tool_name, summary, timestamp, details)
             self.on_flush(block)
 
     def check_idle_flush(self, idle_seconds: float = 1.0) -> None:
-        """Called by poller loop: if agent stopped inspecting for > idle_seconds, flush consolidated line."""
+        """Called by poller loop: silent inspections are discarded to avoid screen jumping."""
         with self._lock:
             if self._pending_inspections and (time.time() - self._last_push_time >= idle_seconds):
-                self._flush_locked()
+                self._pending_inspections.clear()
 
     def flush(self) -> None:
         with self._lock:
@@ -398,143 +399,17 @@ class TuiLineEditor:
         sys.stdout.flush()
 
     def read_line(self, stop_event: threading.Event, on_flush_deferred: Callable[[], None]) -> str | None:
-        if os.name != "nt" or not sys.stdin.isatty():
-            with self.lock:
-                sys.stdout.write(self.prompt_fn())
-                sys.stdout.flush()
-            line = sys.stdin.readline()
-            return line.rstrip("\r\n") if line else None
-
-        with self.lock:
-            self.input_chars.clear()
-            self.cursor_pos = 0
-            self.history_idx = -1
-            self.saved_draft = ""
-            self.redraw_locked()
-
-        while not stop_event.is_set():
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
-                # Windows extended scan keys (Arrows, Home, End, Delete)
-                if ch in ("\x00", "\xe0"):
-                    if msvcrt.kbhit():
-                        code = msvcrt.getwch()
-                        with self.lock:
-                            if code == "K":  # Left
-                                if self.cursor_pos > 0:
-                                    self.cursor_pos -= 1
-                                    self.redraw_locked()
-                            elif code == "M":  # Right
-                                if self.cursor_pos < len(self.input_chars):
-                                    self.cursor_pos += 1
-                                    self.redraw_locked()
-                            elif code == "G":  # Home
-                                self.cursor_pos = 0
-                                self.redraw_locked()
-                            elif code == "O":  # End
-                                self.cursor_pos = len(self.input_chars)
-                                self.redraw_locked()
-                            elif code == "S":  # Delete
-                                if self.cursor_pos < len(self.input_chars):
-                                    self.input_chars.pop(self.cursor_pos)
-                                    self.redraw_locked()
-                            elif code == "H":  # Up (History prev)
-                                if self.history:
-                                    if self.history_idx == -1:
-                                        self.saved_draft = "".join(self.input_chars)
-                                    if self.history_idx < len(self.history) - 1:
-                                        self.history_idx += 1
-                                        target = self.history[-(self.history_idx + 1)]
-                                        self.input_chars = list(target)
-                                        self.cursor_pos = len(self.input_chars)
-                                        self.redraw_locked()
-                            elif code == "P":  # Down (History next)
-                                if self.history_idx > 0:
-                                    self.history_idx -= 1
-                                    target = self.history[-(self.history_idx + 1)]
-                                    self.input_chars = list(target)
-                                    self.cursor_pos = len(self.input_chars)
-                                    self.redraw_locked()
-                                elif self.history_idx == 0:
-                                    self.history_idx = -1
-                                    self.input_chars = list(self.saved_draft)
-                                    self.cursor_pos = len(self.input_chars)
-                                    self.redraw_locked()
-                    continue
-
-                if ch == "\x03":  # Ctrl+C
-                    raise KeyboardInterrupt
-
-                if ch in ("\r", "\n"):
-                    # Paste detection: more characters immediate in buffer
-                    if msvcrt.kbhit():
-                        with self.lock:
-                            self.input_chars.insert(self.cursor_pos, "\n")
-                            self.cursor_pos += 1
-                        continue
-
-                    with self.lock:
-                        text = "".join(self.input_chars)
-                        self.input_chars.clear()
-                        self.cursor_pos = 0
-                        self.history_idx = -1
-                        sys.stdout.write("\n")
-                        on_flush_deferred()
-                        sys.stdout.flush()
-
-                    if text.strip():
-                        if not self.history or self.history[-1] != text:
-                            self.history.append(text)
-                            if len(self.history) > 100:
-                                self.history.pop(0)
-                    return text
-
-                if ch == "\x08":  # Backspace
-                    with self.lock:
-                        if self.cursor_pos > 0:
-                            self.input_chars.pop(self.cursor_pos - 1)
-                            self.cursor_pos -= 1
-                        if not self.input_chars:
-                            on_flush_deferred()
-                        self.redraw_locked()
-                    continue
-
-                if ch in ("\x15", "\x1b"):  # Ctrl+U or ESC: clear current buffer
-                    with self.lock:
-                        self.input_chars.clear()
-                        self.cursor_pos = 0
-                        on_flush_deferred()
-                        self.redraw_locked()
-                    continue
-
-                if ch.isprintable() or ch == "\t":
-                    burst = [ch]
-                    while msvcrt.kbhit():
-                        nxt = msvcrt.getwch()
-                        if nxt == "\x03":
-                            raise KeyboardInterrupt
-                        if nxt in ("\r", "\n"):
-                            burst.append("\n")
-                        elif nxt.isprintable() or nxt == "\t":
-                            burst.append(nxt)
-
-                    with self.lock:
-                        for b_char in burst:
-                            self.input_chars.insert(self.cursor_pos, b_char)
-                            self.cursor_pos += 1
-                        full_buf = "".join(self.input_chars)
-                        if len(burst) > 40 or "\n" in full_buf:
-                            nl_cnt = full_buf.count("\n")
-                            sys.stdout.write(
-                                f"\r\033[K{self.prompt_fn()}{Theme.WARN}[pasted: {nl_cnt + 1} lines, {len(full_buf)} chars · ENTER send · ESC cancel]{Theme.RESET}"
-                            )
-                        else:
-                            self.redraw_locked()
-                        sys.stdout.flush()
-            else:
-                time.sleep(0.015)
-
-        return None
+        try:
+            sys.stdout.write(self.prompt_fn()); sys.stdout.flush(); line = input()
+            res = line.strip()
+            if res:
+                if not self.history or self.history[-1] != res:
+                    self.history.append(res)
+                    if len(self.history) > 100:
+                        self.history.pop(0)
+            return res
+        except (KeyboardInterrupt, EOFError):
+            return None
 
 
 # -----------------------------------------------------------------------------
@@ -562,18 +437,7 @@ class MessengerController:
 
     def safe_print_above_prompt(self, block: str, *, is_tool_action: bool = False) -> None:
         with self.editor.lock:
-            # If user is actively typing, queue background tool logs so screen doesn't jump
-            if is_tool_action and not self.editor.is_empty():
-                self.deferred_tool_blocks.append(block)
-                if len(self.deferred_tool_blocks) > 30:
-                    self.deferred_tool_blocks.pop(0)
-                return
-
-            buf = "".join(self.editor.input_chars)
-            sys.stdout.write(f"\r\033[K{block}\n\n{self.prompt_str()}{Theme.TEXT}{buf}{Theme.RESET}")
-            dist = len(self.editor.input_chars) - self.editor.cursor_pos
-            if dist > 0:
-                sys.stdout.write(f"\033[{dist}D")
+            sys.stdout.write(f"\n{block}\n")
             sys.stdout.flush()
 
     def flush_deferred(self) -> None:
@@ -587,9 +451,13 @@ class MessengerController:
     def _on_consolidated_action(self, block: str) -> None:
         self.safe_print_above_prompt(block, is_tool_action=True)
 
-    def _is_noisy_action(self, tool_name: str, summary: str) -> bool:
+    def _is_noisy_action(self, tool_name: str, summary: str, details: str = "") -> bool:
+        if details:
+            return False
+        if tool_name in {"read_file", "search_files", "list_dir", "file_ops"}:
+            return True
         low_s = (summary or "").strip().lower()
-        if low_s.startswith(("inbox:", "jobs:")):
+        if low_s.startswith(("inbox:", "jobs:", "sysinfo:", "py:", "ps:")):
             return True
         if low_s.endswith(("agent_outbox.txt", "bridge_chat.txt", "live_inbox.json", "run_task.py")):
             return True
@@ -606,7 +474,7 @@ class MessengerController:
                         self.seen_action_ids.add(aid)
                         t_name = act.get("tool", "tool")
                         t_sum = act.get("summary", "")
-                        if self._is_noisy_action(t_name, t_sum):
+                        if self._is_noisy_action(t_name, t_sum, act.get("details", "")):
                             continue
                         act_sig = f"{t_name}|{t_sum.strip()}"
                         if act_sig == self.last_rendered_act_sig:
@@ -618,17 +486,11 @@ class MessengerController:
                 # Check idle flush for consolidated reading actions
                 self.consolidator.check_idle_flush(idle_seconds=1.2)
 
-                # Agent telemetry tool updates
+                # Agent telemetry updated silently (no duplicate printing)
                 tele = state.get("agent_telemetry") or {}
                 cur_tool = tele.get("last_tool") or ""
-                cur_sum = tele.get("last_summary") or ""
                 cur_upd = tele.get("updated_at") or ""
-                sig = f"{cur_tool}|{cur_upd}"
-                if cur_tool and sig != self.last_tool_sig:
-                    self.last_tool_sig = sig
-                    if not self._is_noisy_action(cur_tool, cur_sum) and not state.get("action_log"):
-                        ts_now = cur_upd[11:19] if len(cur_upd) >= 19 else time.strftime("%H:%M:%S")
-                        self.consolidator.push(cur_tool, cur_sum, ts_now)
+                self.last_tool_sig = f"{cur_tool}|{cur_upd}"
 
                 # Process messages
                 for m in state.get("messages") or []:
