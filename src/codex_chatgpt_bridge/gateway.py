@@ -735,6 +735,11 @@ class LocalGateway:
                 resolved.unlink(missing_ok=True)
             msg = self.inbox_send_agent_reply(content.strip())
             return {"path": str(resolved), "bytes": len(content.encode("utf-8")), "bridge_chat_delivered": msg}
+        existed_before = resolved.exists()
+        old_line_count = 0
+        if existed_before and resolved.is_file():
+            with contextlib.suppress(Exception):
+                old_line_count = len(resolved.read_text(encoding="utf-8", errors="replace").splitlines())
         await asyncio.to_thread(resolved.write_text, content, encoding="utf-8")
         if resolved.name.lower() == "run_task.py" and content.strip():
             job = await self._job_manager.start_job(
@@ -745,6 +750,19 @@ class LocalGateway:
             )
             waited_res = await self._job_manager.wait_for_job(job.job_id, timeout_s=18.0)
             return {"path": str(resolved), "bytes": len(content.encode("utf-8")), "job": waited_res}
+        with contextlib.suppress(Exception):
+            new_lines = content.replace("\r\n", "\n").splitlines()
+            byte_len = len(content.encode("utf-8"))
+            if existed_before:
+                header = f"Replaced file · +{len(new_lines)} / -{old_line_count} lines ({byte_len} B)"
+            else:
+                header = f"Created file · +{len(new_lines)} lines ({byte_len} B)"
+            w_preview = [header]
+            for idx, nl in enumerate(new_lines[:8], 1):
+                w_preview.append(f"+ {idx:>4d} │ {nl[:104]}")
+            if len(new_lines) > 8:
+                w_preview.append(f"+ ... ({len(new_lines) - 8} more lines)")
+            self._inbox_store.record_agent_activity("write_file", str(resolved), "\n".join(w_preview))
         return {"path": str(resolved), "bytes": len(content.encode("utf-8"))}
 
     async def _apply_inline_edit_block(self, path: str, content: str) -> JsonObject:
@@ -787,11 +805,15 @@ class LocalGateway:
         uses_crlf = b"\r\n" in raw_bytes
         current_text = raw_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
         normalized_new = new_text.replace("\r\n", "\n")
+        base_line = 1
+        old_lines: list[str] = []
 
         if mode == "append":
+            base_line = current_text.count("\n") + 1
             updated_text = current_text + normalized_new
             replacements = 1
         elif mode == "prepend":
+            base_line = 1
             updated_text = normalized_new + current_text
             replacements = 1
         elif mode == "replace_lines":
@@ -802,6 +824,8 @@ class LocalGateway:
             e_idx = end_line if end_line is not None else start_line
             if s_idx > len(lines):
                 raise BridgeError(f"start_line={start_line} exceeds file length ({len(lines)})")
+            base_line = start_line
+            old_lines = [ln.rstrip("\r\n") for ln in lines[s_idx:e_idx]]
             replacement_lines = (
                 [normalized_new]
                 if normalized_new.endswith("\n") or not normalized_new
@@ -822,6 +846,9 @@ class LocalGateway:
                     f"old_text matched {count} locations in {resolved}; "
                     "pass replace_all=True or include more surrounding context"
                 )
+            pos = current_text.find(normalized_old)
+            base_line = (current_text[:pos].count("\n") + 1) if pos >= 0 else 1
+            old_lines = normalized_old.splitlines()
             if replace_all:
                 updated_text = current_text.replace(normalized_old, normalized_new)
                 replacements = count
@@ -835,17 +862,19 @@ class LocalGateway:
         final_bytes = final_text.encode("utf-8")
         await asyncio.to_thread(resolved.write_bytes, final_bytes)
         with contextlib.suppress(Exception):
-            old_lines = (old_text or "").replace("\r\n", "\n").splitlines() if mode == "replace" else []
             new_lines = normalized_new.splitlines()
-            diff_preview = [f"Added {len(new_lines)} lines, removed {len(old_lines)} lines"]
-            for ol in old_lines[:6]:
-                diff_preview.append(f"- {ol[:100]}")
-            if len(old_lines) > 6:
-                diff_preview.append(f"- ... ({len(old_lines) - 6} more lines)")
-            for nl in new_lines[:8]:
-                diff_preview.append(f"+ {nl[:100]}")
-            if len(new_lines) > 8:
-                diff_preview.append(f"+ ... ({len(new_lines) - 8} more lines)")
+            rep_label = f"{replacements} replacement" + ("s" if replacements != 1 else "")
+            diff_preview = [
+                f"@@ L{base_line} · +{len(new_lines)} / -{len(old_lines)} lines ({mode}, {rep_label}) @@"
+            ]
+            for idx, ol in enumerate(old_lines[:8]):
+                diff_preview.append(f"- {base_line + idx:>4d} │ {ol[:104]}")
+            if len(old_lines) > 8:
+                diff_preview.append(f"- ... ({len(old_lines) - 8} more removed lines)")
+            for idx, nl in enumerate(new_lines[:10]):
+                diff_preview.append(f"+ {base_line + idx:>4d} │ {nl[:104]}")
+            if len(new_lines) > 10:
+                diff_preview.append(f"+ ... ({len(new_lines) - 10} more added lines)")
             self._inbox_store.record_agent_activity("edit_file", str(resolved), "\n".join(diff_preview))
         return {
             "path": str(resolved),
@@ -1081,7 +1110,7 @@ class LocalGateway:
         if not resolved_cwd.exists() or not resolved_cwd.is_dir():
             resolved_cwd = Path.home()
 
-        return await self._job_manager.run_command(
+        res = await self._job_manager.run_command(
             command=command,
             cwd=resolved_cwd,
             shell=shell,
@@ -1090,6 +1119,39 @@ class LocalGateway:
             auto_background_on_timeout=auto_background_on_timeout,
             env=env,
         )
+        with contextlib.suppress(Exception):
+            eff_shell = str(res.get("shell") or shell or "auto").lower()
+            prefix_map = {"python": "py: ", "powershell": "ps: ", "cmd": "cmd: ", "sh": "sh: "}
+            cmd_lines = [ln.strip() for ln in command.strip().splitlines() if ln.strip()]
+            first_cmd = cmd_lines[0] if cmd_lines else command.strip()
+            summary_str = f"{prefix_map.get(eff_shell, '')}{first_cmd}"[:200]
+            status = str(res.get("status") or "completed")
+            rc = res.get("returncode")
+            elapsed = float(res.get("elapsed_s") or 0.0)
+            cwd_name = Path(str(res.get("cwd") or resolved_cwd)).name or str(resolved_cwd)
+            if status == "running_in_background" or res.get("background"):
+                head = f"Running in background (job {res.get('job_id')}, pid {res.get('pid')}) · {elapsed:.2f}s · cwd: {cwd_name}"
+            elif rc == 0 or rc is None:
+                head = f"Exit 0 (ok) · {elapsed:.2f}s · cwd: {cwd_name}"
+            else:
+                head = f"Exit {rc} (error) · {elapsed:.2f}s · cwd: {cwd_name}"
+            exec_details = [head]
+            for cl in cmd_lines[:3]:
+                exec_details.append(f"$ {cl[:108]}")
+            if len(cmd_lines) > 3:
+                exec_details.append(f"$ ... (+{len(cmd_lines) - 3} more script lines)")
+            stdout_lines = [ln.rstrip() for ln in str(res.get("stdout") or "").splitlines() if ln.strip()]
+            stderr_lines = [ln.rstrip() for ln in str(res.get("stderr") or "").splitlines() if ln.strip()]
+            for sl in stdout_lines[:8]:
+                exec_details.append(f"> {sl[:108]}")
+            if len(stdout_lines) > 8:
+                exec_details.append(f"> ... (+{len(stdout_lines) - 8} more stdout lines)")
+            for el in stderr_lines[:5]:
+                exec_details.append(f"! {el[:108]}")
+            if len(stderr_lines) > 5:
+                exec_details.append(f"! ... (+{len(stderr_lines) - 5} more stderr lines)")
+            self._inbox_store.record_agent_activity("exec_command", summary_str, "\n".join(exec_details))
+        return res
 
     async def process_manager(
         self,

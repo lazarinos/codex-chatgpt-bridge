@@ -212,18 +212,37 @@ class LiveInboxStore:
             "updated_at": now_iso,
         }
         action_log = data.setdefault("action_log", [])
-        if action_log and action_log[-1].get("tool") == tool_name and action_log[-1].get("summary") == clean_sum and not details:
-            action_log[-1]["timestamp"] = now_iso
-        else:
-            entry: JsonObject = {
-                "id": str(uuid4())[:8],
-                "tool": tool_name,
-                "summary": clean_sum,
-                "timestamp": now_iso,
-            }
-            if details:
-                entry["details"] = details[:2400]
-            action_log.append(entry)
+        if action_log:
+            last = action_log[-1]
+            same_or_delegated = (
+                last.get("tool") == tool_name
+                or (
+                    last.get("tool") in {"read_file", "write_file"}
+                    and tool_name in {"exec_command", "edit_file", "write_file"}
+                )
+            )
+            if same_or_delegated and last.get("summary") == clean_sum and not details:
+                last["timestamp"] = now_iso
+                self._save(data)
+                return
+            if same_or_delegated and details and not last.get("details"):
+                last["id"] = str(uuid4())[:8]
+                last["tool"] = tool_name
+                last["summary"] = clean_sum
+                last["timestamp"] = now_iso
+                last["details"] = details[:2400]
+                self._save(data)
+                return
+
+        entry: JsonObject = {
+            "id": str(uuid4())[:8],
+            "tool": tool_name,
+            "summary": clean_sum,
+            "timestamp": now_iso,
+        }
+        if details:
+            entry["details"] = details[:2400]
+        action_log.append(entry)
         self._save(data)
 
     def get_state(self, *, limit: int = 50) -> JsonObject:
