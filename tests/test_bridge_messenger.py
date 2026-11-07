@@ -3,11 +3,19 @@ from __future__ import annotations
 import subprocess
 import sys
 import bridge_messenger
-from bridge_messenger import ActivityConsolidator, TuiRenderer, format_tool_call
+from bridge_messenger import (
+    ActivityConsolidator,
+    AnsiTextMetrics,
+    FeedEvent,
+    MessengerController,
+    Theme,
+    TuiLineEditor,
+    TuiRenderer,
+    format_tool_call,
+)
 
 
 def test_format_tool_call_without_prefix_does_not_raise() -> None:
-    # Empty or none summaries
     res_empty = format_tool_call("idle", "", "12:00:00")
     assert "idle" in res_empty
     assert "12:00:00" in res_empty
@@ -15,7 +23,6 @@ def test_format_tool_call_without_prefix_does_not_raise() -> None:
     res_none = format_tool_call("idle", None, "12:00:00")
     assert "idle" in res_none
 
-    # Standard tool without command prefix
     res_tool = format_tool_call("read_file", "path/to/file.py", "12:00:00")
     assert "Read" in res_tool
     assert "path/to/file.py" in res_tool
@@ -48,22 +55,17 @@ def test_activity_consolidator_groups_consecutive_reads() -> None:
     flushed_blocks: list[str] = []
     consolidator = ActivityConsolidator(on_flush=flushed_blocks.append)
 
-    # Push 3 consecutive reads
     consolidator.push("read_file", "src/one.py", "12:00:01")
     consolidator.push("read_file", "src/two.py", "12:00:02")
     consolidator.push("search_files", "def main", "12:00:03")
 
-    # Nothing flushed yet because they are batched
     assert len(flushed_blocks) == 0
 
-    # Significant action arrives: triggers flush of consolidated inspections + immediate action
     consolidator.push("exec_command", "pytest", "12:00:05")
 
     assert len(flushed_blocks) == 2
-    # First block is the consolidated summary of the 3 inspections
     assert "Inspected 3 files/locations" in flushed_blocks[0]
     assert "one.py" in flushed_blocks[0]
-    # Second block is the bash command
     assert "Bash" in flushed_blocks[1]
     assert "pytest" in flushed_blocks[1]
 
@@ -82,7 +84,6 @@ def test_activity_consolidator_single_read_flushes_normal_line() -> None:
 
 def test_tui_renderer_agent_messages_no_emojis_and_no_bell() -> None:
     msg = TuiRenderer.format_agent_message("12:00:00", "Hello world, what do you think?")
-    # Check that it formats as a question without emoji characters or ASCII bells
     assert "Question" in msg
     assert "?" not in msg or "❓" not in msg
     assert "\a" not in msg
@@ -94,7 +95,7 @@ def test_tui_renderer_agent_messages_no_emojis_and_no_bell() -> None:
 
 
 def test_messenger_controller_seeds_all_initial_messages() -> None:
-    from bridge_messenger import MessengerController, BridgeClient
+    from bridge_messenger import BridgeClient
 
     class MockClient(BridgeClient):
         def get_state(self, limit: int = 50) -> dict:
@@ -108,20 +109,16 @@ def test_messenger_controller_seeds_all_initial_messages() -> None:
             }
 
     ctrl = MessengerController(client=MockClient())
-    # Mock terminal width and stdout write to avoid printing during test
-    ctrl.client = MockClient()
     init_state = ctrl.client.get_state()
     for m in init_state["messages"]:
         ctrl.seen_ids.add(m["id"])
 
     assert len(ctrl.seen_ids) == 25
-    # Verify every pre-existing message ID is in seen_ids
     for i in range(25):
         assert f"msg-{i}" in ctrl.seen_ids
 
 
 def test_terminal_chat_startup_and_exit() -> None:
-    # Run bridge_messenger with empty input via pipe; it should exit with code 0 cleanly
     res = subprocess.run(
         [sys.executable, "bridge_messenger.py"],
         input="",
@@ -131,3 +128,98 @@ def test_terminal_chat_startup_and_exit() -> None:
         capture_output=True,
     )
     assert res.returncode == 0
+
+
+def test_format_tool_call_exec_command_details() -> None:
+    details = "Exit 0 (ok) · 42ms · cwd: E:/ADS-AAA\n$ git status --short\n> M runtime/l4d2/world_hands.cpp\n! warning: LF will be replaced by CRLF"
+    res = format_tool_call("exec_command", "ps: git status --short", "12:05:00", details)
+    assert "PowerShell" in res
+    assert "Exit 0 (ok)" in res
+    assert "$ git status --short" in res
+    assert "M runtime/l4d2/world_hands.cpp" in res
+    assert "! warning: LF will be replaced by CRLF" in res
+
+
+def test_live_inbox_upgrades_pending_action_with_details(tmp_path) -> None:
+    from codex_chatgpt_bridge.live_inbox import LiveInboxStore
+
+    store = LiveInboxStore(tmp_path / "live_inbox.json")
+    store.record_agent_activity("read_file", "py: print(42)", "")
+    state1 = store.get_state()
+    assert len(state1["action_log"]) == 1
+    first_id = state1["action_log"][0]["id"]
+    assert state1["action_log"][0].get("details", "") == ""
+
+    store.record_agent_activity("exec_command", "py: print(42)", "Exit 0 (ok) · 10ms\n$ print(42)\n> 42")
+    state2 = store.get_state()
+    assert len(state2["action_log"]) == 1
+    assert state2["action_log"][0]["id"] != first_id
+    assert state2["action_log"][0]["tool"] == "exec_command"
+    assert "> 42" in state2["action_log"][0]["details"]
+
+
+def test_ansi_metrics_and_resize_safe_box_clamping() -> None:
+    styled = f"{Theme.ACCENT}{Theme.BOLD}Hello World{Theme.RESET}"
+    assert AnsiTextMetrics.strip_ansi(styled) == "Hello World"
+    assert AnsiTextMetrics.visible_width(styled) == 11
+
+    # Render a box with a very long line into a narrow 44-column terminal
+    long_line = "This is a long diagnostic line that previously overflowed narrow terminals when resized"
+    box = TuiRenderer.render_box([(long_line, -1)], title="Resize Test", width=44)
+    for line in box.splitlines():
+        assert AnsiTextMetrics.visible_width(line) == 44
+
+
+def test_framed_input_box_wrapping_and_slash_hint() -> None:
+    editor = TuiLineEditor(
+        prompt_fn=lambda: "> ",
+        status_provider=lambda: {
+            "priority": "urgent",
+            "view_mode": "all",
+            "filter_query": "",
+            "unread_count": 2,
+            "agent_tool": "Bash",
+            "agent_summary": "cargo build",
+        },
+    )
+    # Type a long message that wraps inside the framed input box at width=50
+    editor.input_chars = list("hermano revisa por que crasheo el juego cuando entre al mapa")
+    editor.cursor_pos = len(editor.input_chars)
+    lines = editor.build_input_box_lines(width=50)
+    assert len(lines) >= 4  # top border + at least 2 wrapped input rows + bottom border
+    assert lines[0].startswith(f"{Theme.ERROR}{Theme.CORNER_TL}")
+    assert lines[-1].startswith(f"{Theme.ERROR}{Theme.CORNER_BL}")
+    for ln in lines:
+        assert AnsiTextMetrics.visible_width(ln) == 50
+
+    # Type a slash prefix and verify live autocomplete hint appears inside the box
+    editor.input_chars = list("/fi")
+    editor.cursor_pos = 3
+    slash_lines = editor.build_input_box_lines(width=64)
+    joined_plain = "\n".join(AnsiTextMetrics.strip_ansi(x) for x in slash_lines)
+    assert "/filter" in joined_plain
+    assert editor._autocomplete_locked() is True
+    assert "".join(editor.input_chars) == "/filter "
+
+
+def test_feed_event_view_modes_and_reflow_widths() -> None:
+    ev_chat = FeedEvent(kind="agent", timestamp="12:00:00", text="Hola hermano, revisando los logs de L4D2.")
+    ev_tool = FeedEvent(kind="tool", timestamp="12:00:01", tool_name="exec_command", summary="ps: cargo test")
+
+    assert ev_chat.matches_view("all") is True
+    assert ev_chat.matches_view("chat") is True
+    assert ev_chat.matches_view("tools") is False
+
+    assert ev_tool.matches_view("all") is True
+    assert ev_tool.matches_view("chat") is False
+    assert ev_tool.matches_view("tools") is True
+
+    assert ev_chat.matches_view("all", filter_query="l4d2") is True
+    assert ev_chat.matches_view("all", filter_query="rust") is False
+
+    # Verify rendering adapts cleanly to both 42-col and 100-col widths without overflow
+    for w in (42, 72, 100):
+        for line in ev_chat.render(width=w).splitlines():
+            assert AnsiTextMetrics.visible_width(line) <= w
+        for line in ev_tool.render(width=w).splitlines():
+            assert AnsiTextMetrics.visible_width(line) <= w
