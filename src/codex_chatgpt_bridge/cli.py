@@ -223,7 +223,23 @@ def _apply_windows_socket_inheritance_protection() -> None:
     Server.startup = startup_safe  # type: ignore[method-assign]
 
 
+def _ensure_stdio() -> None:
+    """Ensure stdout and stderr exist even in pythonw / windowless daemon mode on Windows."""
+    import os
+    if sys.stdout is None:
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        except Exception:
+            pass
+    if sys.stderr is None:
+        try:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        except Exception:
+            pass
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
+    _ensure_stdio()
     _apply_windows_socket_inheritance_protection()
     config = load_config(args.config)
     if args.host:

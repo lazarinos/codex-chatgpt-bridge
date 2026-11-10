@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Continue"
-Write-Host "=== Reiniciando Codex ChatGPT Bridge (Turbo v0.2.0) ===" -ForegroundColor Cyan
+Write-Host "=== Reiniciando Bridge (v0.5.0) ===" -ForegroundColor Cyan
 
 # Find any process listening on port 8766
 $conns = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue
@@ -15,18 +15,15 @@ if ($conns) {
 }
 
 $repoDir = "C:\Users\LAZARINOS\codex-chatgpt-bridge-clean"
-$venvPython = Join-Path $repoDir ".venv\Scripts\python.exe"
-$bridgeExe = Join-Path $repoDir ".venv\Scripts\codex-chatgpt-bridge.exe"
 
-if (Test-Path $bridgeExe) {
-    Write-Host "Iniciando bridge en segundo plano desde $bridgeExe..." -ForegroundColor Green
-    Start-Process -FilePath $bridgeExe -ArgumentList "run" -WorkingDirectory $repoDir -WindowStyle Hidden
-} elseif (Test-Path $venvPython) {
-    Write-Host "Iniciando bridge con Python del .venv..." -ForegroundColor Green
-    Start-Process -FilePath $venvPython -ArgumentList "-m", "codex_chatgpt_bridge.cli", "run" -WorkingDirectory $repoDir -WindowStyle Hidden
+# Prefer global 'bridge' CLI command, fallback to python -m
+$bridgeCmd = Get-Command "bridge" -ErrorAction SilentlyContinue
+if ($bridgeCmd) {
+    Write-Host "Iniciando bridge con comando 'bridge' ($($bridgeCmd.Source))..." -ForegroundColor Green
+    Start-Process -FilePath $bridgeCmd.Source -ArgumentList "run" -WorkingDirectory $repoDir -WindowStyle Hidden
 } else {
-    Write-Host "Iniciando bridge con codex-chatgpt-bridge global..." -ForegroundColor Green
-    Start-Process -FilePath "codex-chatgpt-bridge" -ArgumentList "run" -WorkingDirectory $repoDir -WindowStyle Hidden
+    Write-Host "Iniciando bridge con python -m codex_chatgpt_bridge.cli run..." -ForegroundColor Green
+    Start-Process -FilePath "python.exe" -ArgumentList "-m", "codex_chatgpt_bridge.cli", "run" -WorkingDirectory $repoDir -WindowStyle Hidden
 }
 
 Start-Sleep -Seconds 2

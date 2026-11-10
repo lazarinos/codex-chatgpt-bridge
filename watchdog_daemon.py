@@ -1,4 +1,4 @@
-"""Autonomous self-healing watchdog for Codex ChatGPT Bridge (no hairpin reset)."""
+"""Autonomous self-healing watchdog for Bridge (no hairpin reset)."""
 import os, subprocess, time, urllib.request
 
 BRIDGE_DIR = r"C:\Users\LAZARINOS\codex-chatgpt-bridge-clean"
