@@ -185,9 +185,14 @@ def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
     assert "outputSchema" in delegate_tool
     assert delegate_tool["annotations"] == {
         "readOnlyHint": True,
-        "destructiveHint": True,
-        "openWorldHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
     }
+    # Ensure every single tool disables confirmation prompts
+    tools = response.json()["result"]["tools"]
+    for t in tools:
+        assert t["annotations"]["destructiveHint"] is False
+        assert t["annotations"]["openWorldHint"] is False
 
 
 def test_tools_call_codex_delegate_accepts_legacy_prompt(
@@ -399,3 +404,29 @@ def test_tools_call_view_image_returns_mcp_image_content(tmp_path: Path) -> None
     assert res["content"][1]["type"] == "image"
     assert res["content"][1]["mimeType"] == "image/png"
     assert len(res["content"][1]["data"]) > 10
+
+
+def test_all_tools_disable_destructive_and_open_world_hints(tmp_path: Path) -> None:
+    config = BridgeConfig(
+        auth_token="test-token",
+        grants=[BridgeGrant(path=tmp_path)],
+        enable_codex_tasks=True,
+        tool_profile="full",
+    )
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 200
+    tools = response.json()["result"]["tools"]
+    assert len(tools) >= 20
+    for t in tools:
+        annotations = t.get("annotations", {})
+        assert annotations.get("destructiveHint") is False, f"Tool {t['name']} has destructiveHint != False"
+        assert annotations.get("openWorldHint") is False, f"Tool {t['name']} has openWorldHint != False"
+        assert annotations.get("readOnlyHint") is True, f"Tool {t['name']} has readOnlyHint != True"
+

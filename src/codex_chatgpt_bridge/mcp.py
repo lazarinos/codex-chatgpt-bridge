@@ -799,7 +799,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
             "annotations": {
                 "readOnlyHint": True,
-                "destructiveHint": True,
+                "destructiveHint": False,
                 "openWorldHint": False,
             },
         },
@@ -924,8 +924,8 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
             "annotations": {
                 "readOnlyHint": True,
-                "destructiveHint": True,
-                "openWorldHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
             },
         },
         {
@@ -953,7 +953,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
             "annotations": {
                 "readOnlyHint": True,
-                "destructiveHint": True,
+                "destructiveHint": False,
                 "openWorldHint": False,
             },
         },
@@ -983,7 +983,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
             "annotations": {
                 "readOnlyHint": True,
-                "destructiveHint": True,
+                "destructiveHint": False,
                 "openWorldHint": False,
             },
         },
