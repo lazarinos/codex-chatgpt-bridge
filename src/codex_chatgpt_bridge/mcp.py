@@ -736,18 +736,6 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
 
 
 def _bridge_task_tool_definitions() -> list[JsonObject]:
-    bridge_session_sandbox = {
-        "type": "string",
-        "enum": ["full_access", "workspace_write", "read_only", "danger_full_access"],
-        "default": "full_access",
-        "description": "Execution access mode. Defaults to full_access for direct execution.",
-    }
-    bridge_delegate_sandbox = {
-        "type": ["string", "null"],
-        "enum": ["full_access", "workspace_write", "read_only", "danger_full_access", None],
-        "default": None,
-        "description": "Optional execution mode override.",
-    }
     delegate_permission_level = {
         "type": "string",
         "enum": [
@@ -776,11 +764,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                 "properties": {
                     "prompt": {"type": "string", "minLength": 1, "maxLength": 20000},
                     "cwd": {"type": "string", "minLength": 1, "maxLength": 1000},
-                    "sandbox_mode": {
-                        "type": "string",
-                        "enum": ["full_access", "read_only", "workspace_write", "danger_full_access"],
-                        "default": "full_access",
-                    },
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -803,7 +786,7 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
             "description": (
                 "Delegate a complete local computer, file, terminal, build, test, GUI, or project "
                 "task directly to the local execution engine. Provide a concrete task, optional paths, "
-                "and expected result so the task executes directly."
+                "and expected result so the task executes directly to completion in a single operation."
             ),
             "inputSchema": {
                 "type": "object",
@@ -871,7 +854,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                             "Optional latest or bridge_session_id to continue."
                         ),
                     },
-                    "sandbox_mode": bridge_delegate_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -888,7 +870,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                     "bridge_session_id": {"type": "string"},
                     "session_id": {"type": ["string", "null"]},
                     "cwd": {"type": "string"},
-                    "sandbox_mode": {"type": "string"},
                     "returncode": {"type": "integer"},
                     "final_message": {"type": "string"},
                     "stdout_tail": {"type": "string"},
@@ -903,7 +884,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                 "required": [
                     "bridge_session_id",
                     "cwd",
-                    "sandbox_mode",
                     "returncode",
                     "final_message",
                     "delegation_mode",
@@ -930,7 +910,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                 "properties": {
                     "prompt": {"type": "string", "minLength": 1, "maxLength": 20000},
                     "cwd": {"type": "string", "minLength": 1, "maxLength": 1000},
-                    "sandbox_mode": bridge_session_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -960,7 +939,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                         "default": "latest",
                         "description": "Use latest or a bridge_session_id.",
                     },
-                    "sandbox_mode": bridge_session_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,

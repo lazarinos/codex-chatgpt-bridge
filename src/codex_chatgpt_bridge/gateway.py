@@ -153,6 +153,31 @@ _BINARY_EXTENSIONS: set[str] = {
 _LINE_RANGE_RE = re.compile(r"^(?P<path>.+?)#L(?P<start>\d+)(?:-L?(?P<end>\d+))?$")
 
 
+def find_rg_path() -> str | None:
+    """Find the ripgrep binary on PATH or common Windows package locations."""
+    found = shutil.which("rg")
+    if found:
+        return found
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            link = Path(local_app_data) / "Microsoft" / "WinGet" / "Links" / "rg.exe"
+            if link.exists():
+                return str(link)
+            pkg_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+            if pkg_root.exists():
+                for candidate in pkg_root.glob("BurntSushi.ripgrep*/**/rg.exe"):
+                    if candidate.exists():
+                        return str(candidate)
+        for path_str in (
+            r"C:\Program Files\ripgrep\rg.exe",
+            r"C:\ProgramData\chocolatey\bin\rg.exe",
+        ):
+            if Path(path_str).exists():
+                return path_str
+    return None
+
+
 class BridgeError(RuntimeError):
     """User-facing bridge error."""
 
@@ -228,8 +253,8 @@ class LocalGateway:
             "unread_user_messages": len(self._inbox_store.peek_unread_for_agent()),
             "live_inbox_enabled": True,
             "bridge_chat_channel": "active (consola interactiva 'bridge chat' conectada a live_inbox.json)",
-            "ripgrep_available": shutil.which("rg") is not None,
-            "search_engine": "ripgrep" if shutil.which("rg") else "python_native",
+            "ripgrep_available": find_rg_path() is not None,
+            "search_engine": "ripgrep" if find_rg_path() else "python_native",
             "tools": self._visible_tool_names(),
         }
 
@@ -1371,7 +1396,7 @@ class LocalGateway:
             "drives": drives,
             "binaries": {
                 "codex": shutil.which("codex"),
-                "rg": shutil.which("rg"),
+                "rg": find_rg_path(),
                 "git": shutil.which("git"),
                 "node": shutil.which("node"),
                 "npm": shutil.which("npm"),
@@ -1398,7 +1423,7 @@ class LocalGateway:
             raise BridgeError("max_results must be >= 1")
 
         roots = [self._authorize(root, read=True)] if root else self._readable_roots()
-        has_rg = shutil.which("rg") is not None
+        has_rg = find_rg_path() is not None
         matches: list[JsonObject] = []
         for search_root in roots:
             if not search_root.exists():
@@ -1519,6 +1544,30 @@ class LocalGateway:
                 wait_timeout_s=wait_timeout_s,
             )
             result["delegation_mode"] = "start"
+            final_msg_lower = (result.get("final_message") or "").lower().strip()
+            prompt_markers = (
+                "ready to proceed",
+                "should i proceed",
+                "would you like me to",
+                "shall i proceed",
+                "please confirm",
+                "session initialized",
+                "session configured",
+                "ready to start",
+                "do you want me to",
+                "how would you like to proceed",
+            )
+            if any(marker in final_msg_lower for marker in prompt_markers) and result.get("bridge_session_id"):
+                continue_res = await self.codex_session_continue(
+                    prompt="Execute and complete all steps of the task now. Do not stop to ask questions.",
+                    bridge_session_id=result["bridge_session_id"],
+                    sandbox_mode=resolved_sandbox_mode,
+                    wait_timeout_s=wait_timeout_s,
+                )
+                result["final_message"] = continue_res.get("final_message", result.get("final_message", ""))
+                result["stdout_tail"] = continue_res.get("stdout_tail", result.get("stdout_tail", ""))
+                result["stderr_tail"] = continue_res.get("stderr_tail", result.get("stderr_tail", ""))
+                result["returncode"] = continue_res.get("returncode", result.get("returncode"))
         result["permission_level"] = permission_level
         result["target_paths"] = normalized_paths
         return result
@@ -1580,6 +1629,12 @@ class LocalGateway:
             [
                 "You are the local execution engine performing a task delegated from the remote AI agent.",
                 "Act as the local device agent for this machine.",
+                (
+                    "AUTONOMOUS EXECUTION MANDATE: You MUST execute and completely finish this delegated task "
+                    "immediately in this single run. Do NOT wait for confirmation. Do NOT pause to ask questions. "
+                    "Do NOT stop at planning. Execute all necessary shell/powershell commands, code modifications, "
+                    "file writes, and verification checks right now to reach the expected result."
+                ),
                 f"Permission level: {permission_level}",
                 f"Target paths:\n{path_block}",
                 f"Expected result:\n{result_block}",
@@ -1880,8 +1935,9 @@ class LocalGateway:
         self._config_mtime_ns = self._get_config_mtime_ns()
 
     async def _run_rg(self, *, query: str, root: Path, remaining: int) -> list[JsonObject]:
+        rg_bin = find_rg_path() or "rg"
         command = [
-            "rg",
+            rg_bin,
             "--json",
             "--line-number",
             "--column",

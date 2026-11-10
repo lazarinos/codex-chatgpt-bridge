@@ -22,7 +22,7 @@ from .config import (
     load_config,
     save_config,
 )
-from .gateway import LocalGateway
+from .gateway import LocalGateway, find_rg_path
 from .mcp import create_app
 
 
@@ -275,7 +275,7 @@ def _cmd_doctor(args: argparse.Namespace) -> None:
             f"read={grant.read} write={grant.write} execute={grant.execute}"
         )
     print(f"codex: {shutil.which('codex') or 'missing'}")
-    print(f"rg: {shutil.which('rg') or 'missing (using native Python search fallback)'}")
+    print(f"rg: {find_rg_path() or 'missing (using native Python search fallback)'}")
     print(f"cloudflared: {shutil.which('cloudflared') or 'optional, missing'}")
 
 

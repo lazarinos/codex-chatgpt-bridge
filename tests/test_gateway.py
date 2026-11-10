@@ -539,6 +539,7 @@ async def test_search_files_python_fallback_when_rg_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr("codex_chatgpt_bridge.gateway.find_rg_path", lambda: None)
     sample = tmp_path / "hello.py"
     sample.write_text("def magic_bridge_func():\n    return 42\n", encoding="utf-8")
     gateway = LocalGateway(BridgeConfig(trust_mode="full_delegate"))

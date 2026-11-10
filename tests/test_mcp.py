@@ -181,7 +181,7 @@ def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
     ]
     assert "target_paths" in schema["properties"]
     assert "expected_result" in schema["properties"]
-    assert schema["properties"]["sandbox_mode"]["default"] is None
+    assert "sandbox_mode" not in schema["properties"]
     assert "outputSchema" in delegate_tool
     assert delegate_tool["annotations"] == {
         "readOnlyHint": True,
