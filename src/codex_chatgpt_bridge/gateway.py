@@ -40,17 +40,6 @@ from .live_inbox import LiveInboxStore, default_inbox_path
 from .process_runner import BackgroundJobManager, ShellKind, kill_process_tree, run_argv_captured
 from .security import is_relative_to, is_sensitive_path, resolve_user_path
 
-SandboxMode = Literal["full_access", "read_only", "workspace_write", "danger_full_access"]
-CodexSessionSandboxMode = Literal["full_access", "read_only", "workspace_write", "danger_full_access"]
-BridgeSessionSandboxMode = CodexSessionSandboxMode
-DelegatePermissionLevel = Literal[
-    "read_only",
-    "local_file_write",
-    "repo_edit",
-    "shell_command",
-    "gui_control",
-    "full_local",
-]
 ProcessAction = Literal[
     "list_jobs",
     "job_status",
@@ -74,28 +63,6 @@ FileOpAction = Literal[
 EditMode = Literal["replace", "replace_lines", "append", "prepend"]
 
 JsonObject = dict[str, Any]
-DELEGATE_PERMISSION_LEVELS: set[str] = {
-    "read_only",
-    "local_file_write",
-    "repo_edit",
-    "shell_command",
-    "gui_control",
-    "full_local",
-}
-DELEGATE_DEFAULT_SANDBOX: dict[str, CodexSessionSandboxMode] = {
-    "read_only": "read_only",
-    "local_file_write": "workspace_write",
-    "repo_edit": "workspace_write",
-    "shell_command": "danger_full_access",
-    "gui_control": "danger_full_access",
-    "full_local": "danger_full_access",
-}
-SANDBOX_RANK: dict[str, int] = {
-    "read_only": 0,
-    "workspace_write": 1,
-    "full_access": 2,
-    "danger_full_access": 2,
-}
 _IGNORED_SEARCH_DIRS: set[str] = {
     ".git",
     ".venv",
@@ -288,7 +255,7 @@ class LocalGateway:
                 "bridge_status",
                 *(
                     [
-                        "bridge_delegate",
+                        "bridge_task_run",
                         "bridge_session_list",
                         "bridge_session_status",
                     ]
@@ -315,7 +282,6 @@ class LocalGateway:
             *(["bridge_task_run"] if self._config.enable_codex_tasks else []),
             *(
                 [
-                    "bridge_delegate",
                     "bridge_session_start",
                     "bridge_session_continue",
                     "bridge_session_list",
@@ -1462,7 +1428,6 @@ class LocalGateway:
         *,
         prompt: str,
         cwd: str,
-        sandbox_mode: CodexSessionSandboxMode = "danger_full_access",
         wait_timeout_s: float = 600.0,
     ) -> JsonObject:
         """Start a persisted local Codex session and return its bridge handle."""
@@ -1474,7 +1439,7 @@ class LocalGateway:
             )
         if not prompt.strip():
             raise BridgeError("prompt must not be empty")
-        resolved_cwd = self._authorize_codex_cwd(cwd, sandbox_mode)
+        resolved_cwd = self._authorize_codex_cwd(cwd)
         output_path = self._new_output_path()
         command = [
             self._codex_path(),
@@ -1485,7 +1450,7 @@ class LocalGateway:
             "--json",
             "--output-last-message",
             str(output_path),
-            *self._codex_permission_args(sandbox_mode),
+            *self._codex_permission_args(),
             prompt,
         ]
         return await self._finish_codex_session_run(
@@ -1495,156 +1460,6 @@ class LocalGateway:
             prompt=prompt,
             cwd=resolved_cwd,
             existing_record=None,
-            sandbox_mode=sandbox_mode,
-        )
-
-    async def codex_delegate(
-        self,
-        *,
-        task: str | None = None,
-        prompt: str | None = None,
-        permission_level: DelegatePermissionLevel = "full_local",
-        target_paths: list[str] | None = None,
-        expected_result: str | None = None,
-        cwd: str | None = None,
-        bridge_session_id: str | None = None,
-        sandbox_mode: CodexSessionSandboxMode | None = None,
-        wait_timeout_s: float = 600.0,
-    ) -> JsonObject:
-        """Delegate one whole local task to Codex through a single MCP call."""
-
-        self._maybe_reload_config()
-        task_text = self._delegate_task_text(task=task, prompt=prompt)
-        if permission_level not in DELEGATE_PERMISSION_LEVELS:
-            raise BridgeError("permission_level must be a supported delegate permission level")
-        resolved_sandbox_mode = self._resolve_delegate_sandbox_mode(
-            permission_level=permission_level,
-            sandbox_mode=sandbox_mode,
-        )
-        normalized_paths = self._normalize_delegate_target_paths(target_paths)
-        effective_prompt = self._build_delegate_prompt(
-            task=task_text,
-            permission_level=permission_level,
-            target_paths=normalized_paths,
-            expected_result=expected_result,
-        )
-        if bridge_session_id:
-            result = await self.codex_session_continue(
-                prompt=effective_prompt,
-                bridge_session_id=bridge_session_id,
-                sandbox_mode=resolved_sandbox_mode,
-                wait_timeout_s=wait_timeout_s,
-            )
-            result["delegation_mode"] = "continue"
-        else:
-            result = await self.codex_session_start(
-                prompt=effective_prompt,
-                cwd=cwd or str(Path.home()),
-                sandbox_mode=resolved_sandbox_mode,
-                wait_timeout_s=wait_timeout_s,
-            )
-            result["delegation_mode"] = "start"
-            final_msg_lower = (result.get("final_message") or "").lower().strip()
-            prompt_markers = (
-                "ready to proceed",
-                "should i proceed",
-                "would you like me to",
-                "shall i proceed",
-                "please confirm",
-                "session initialized",
-                "session configured",
-                "ready to start",
-                "do you want me to",
-                "how would you like to proceed",
-            )
-            if any(marker in final_msg_lower for marker in prompt_markers) and result.get("bridge_session_id"):
-                continue_res = await self.codex_session_continue(
-                    prompt="Execute and complete all steps of the task now. Do not stop to ask questions.",
-                    bridge_session_id=result["bridge_session_id"],
-                    sandbox_mode=resolved_sandbox_mode,
-                    wait_timeout_s=wait_timeout_s,
-                )
-                result["final_message"] = continue_res.get("final_message", result.get("final_message", ""))
-                result["stdout_tail"] = continue_res.get("stdout_tail", result.get("stdout_tail", ""))
-                result["stderr_tail"] = continue_res.get("stderr_tail", result.get("stderr_tail", ""))
-                result["returncode"] = continue_res.get("returncode", result.get("returncode"))
-        result["permission_level"] = permission_level
-        result["target_paths"] = normalized_paths
-        return result
-
-    def _delegate_task_text(self, *, task: str | None, prompt: str | None) -> str:
-        raw_task = task if task is not None else prompt
-        if raw_task is None or not raw_task.strip():
-            raise BridgeError("task must not be empty")
-        return raw_task.strip()
-
-    def _normalize_delegate_target_paths(self, target_paths: list[str] | None) -> list[str]:
-        if target_paths is None:
-            return []
-        normalized: list[str] = []
-        for raw_path in target_paths:
-            if not raw_path.strip():
-                raise BridgeError("target_paths must not contain empty paths")
-            normalized.append(str(resolve_user_path(raw_path)))
-        return normalized
-
-    def _resolve_delegate_sandbox_mode(
-        self,
-        *,
-        permission_level: DelegatePermissionLevel,
-        sandbox_mode: CodexSessionSandboxMode | None,
-    ) -> CodexSessionSandboxMode:
-        default_sandbox = DELEGATE_DEFAULT_SANDBOX[permission_level]
-        if sandbox_mode is None:
-            return default_sandbox
-        if sandbox_mode not in SANDBOX_RANK:
-            raise BridgeError(
-                "sandbox_mode must be full_access, read_only, workspace_write, or danger_full_access"
-            )
-        if SANDBOX_RANK[sandbox_mode] > SANDBOX_RANK[default_sandbox]:
-            raise BridgeError(
-                f"sandbox_mode={sandbox_mode} exceeds permission_level={permission_level}"
-            )
-        return sandbox_mode
-
-    def _build_delegate_prompt(
-        self,
-        *,
-        task: str,
-        permission_level: DelegatePermissionLevel,
-        target_paths: list[str],
-        expected_result: str | None,
-    ) -> str:
-        path_block = (
-            "\n".join(f"- {path}" for path in target_paths)
-            if target_paths
-            else "Not specified by caller."
-        )
-        result_block = (
-            expected_result.strip()
-            if expected_result and expected_result.strip()
-            else ("Complete the delegated task and report the outcome.")
-        )
-        return "\n\n".join(
-            [
-                "You are the local execution engine performing a task delegated from the remote AI agent.",
-                "Act as the local device agent for this machine.",
-                (
-                    "AUTONOMOUS EXECUTION MANDATE: You MUST execute and completely finish this delegated task "
-                    "immediately in this single run. Do NOT wait for confirmation. Do NOT pause to ask questions. "
-                    "Do NOT stop at planning. Execute all necessary shell/powershell commands, code modifications, "
-                    "file writes, and verification checks right now to reach the expected result."
-                ),
-                f"Permission level: {permission_level}",
-                f"Target paths:\n{path_block}",
-                f"Expected result:\n{result_block}",
-                f"Task:\n{task}",
-                (
-                    "When finished, summarize the actual local actions taken, changed files "
-                    "or apps touched, commands or checks run, and any exact blocker if the task "
-                    "could not be completed."
-                ),
-            ]
         )
 
     async def codex_session_continue(
@@ -1652,7 +1467,6 @@ class LocalGateway:
         *,
         prompt: str,
         bridge_session_id: str = "latest",
-        sandbox_mode: CodexSessionSandboxMode = "danger_full_access",
         wait_timeout_s: float = 600.0,
     ) -> JsonObject:
         """Continue a persisted local Codex session."""
@@ -1670,7 +1484,7 @@ class LocalGateway:
             raise BridgeError(str(exc)) from exc
         if not record.codex_session_id:
             raise BridgeError(f"record has no Codex session id: {record.bridge_session_id}")
-        resolved_cwd = self._authorize_codex_cwd(record.cwd, sandbox_mode)
+        resolved_cwd = self._authorize_codex_cwd(record.cwd)
         output_path = self._new_output_path()
         command = [
             self._codex_path(),
@@ -1680,7 +1494,7 @@ class LocalGateway:
             "--json",
             "--output-last-message",
             str(output_path),
-            *self._codex_resume_permission_args(sandbox_mode),
+            *self._codex_resume_permission_args(),
             record.codex_session_id,
             prompt,
         ]
@@ -1691,7 +1505,6 @@ class LocalGateway:
             prompt=prompt,
             cwd=resolved_cwd,
             existing_record=record,
-            sandbox_mode=sandbox_mode,
         )
 
     async def codex_session_list(self) -> JsonObject:
@@ -1715,7 +1528,6 @@ class LocalGateway:
         *,
         prompt: str,
         cwd: str,
-        sandbox_mode: SandboxMode = "full_access",
         wait_timeout_s: float = 120.0,
     ) -> JsonObject:
         """Run a bounded local task in an approved executable directory."""
@@ -1727,31 +1539,20 @@ class LocalGateway:
             )
         if not prompt.strip():
             raise BridgeError("prompt must not be empty")
-        if sandbox_mode not in {"full_access", "danger_full_access", "read_only", "workspace_write"}:
-            raise BridgeError("sandbox_mode must be full_access, danger_full_access, read_only, or workspace_write")
-        resolved_cwd = self._authorize(cwd, read=True, execute=True)
-        if sandbox_mode in {"full_access", "danger_full_access", "workspace_write"}:
-            self._authorize(str(resolved_cwd), write=True)
-        codex_path = shutil.which("codex")
-        if codex_path is None:
-            raise BridgeError("codex CLI was not found on PATH")
+        resolved_cwd = self._authorize(cwd, read=True, write=True, execute=True)
+        codex_path = self._codex_path()
         with tempfile.NamedTemporaryFile(
             prefix="bridge-",
             suffix=".txt",
             delete=False,
         ) as handle:
             output_path = Path(handle.name)
-        if sandbox_mode in {"full_access", "danger_full_access"}:
-            sandbox_args = ["--dangerously-bypass-approvals-and-sandbox"]
-        else:
-            sandbox = "workspace-write" if sandbox_mode == "workspace_write" else "read-only"
-            sandbox_args = ["--sandbox", sandbox]
         command = [
             codex_path,
             "exec",
             "--cd",
             str(resolved_cwd),
-            *sandbox_args,
+            "--dangerously-bypass-approvals-and-sandbox",
             "--output-last-message",
             str(output_path),
             prompt,
@@ -1776,22 +1577,14 @@ class LocalGateway:
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
         return {
             "cwd": str(resolved_cwd),
-            "sandbox_mode": sandbox_mode,
             "returncode": returncode,
             "final_message": final_message,
             "stdout_tail": stdout[-8000:],
             "stderr_tail": stderr[-8000:],
         }
 
-    def _authorize_codex_cwd(self, cwd: str, sandbox_mode: CodexSessionSandboxMode) -> Path:
-        if sandbox_mode not in {"full_access", "read_only", "workspace_write", "danger_full_access"}:
-            raise BridgeError(
-                "sandbox_mode must be full_access, read_only, workspace_write, or danger_full_access"
-            )
-        resolved_cwd = self._authorize(cwd, read=True, execute=True)
-        if sandbox_mode in {"full_access", "workspace_write", "danger_full_access"}:
-            self._authorize(str(resolved_cwd), write=True)
-        return resolved_cwd
+    def _authorize_codex_cwd(self, cwd: str) -> Path:
+        return self._authorize(cwd, read=True, write=True, execute=True)
 
     def _codex_path(self) -> str:
         codex_path = shutil.which("codex")
@@ -1799,16 +1592,11 @@ class LocalGateway:
             raise BridgeError("codex CLI was not found on PATH")
         return codex_path
 
-    def _codex_permission_args(self, sandbox_mode: CodexSessionSandboxMode) -> list[str]:
-        if sandbox_mode in {"danger_full_access", "full_access"}:
-            return ["--dangerously-bypass-approvals-and-sandbox"]
-        sandbox = "workspace-write" if sandbox_mode == "workspace_write" else "read-only"
-        return ["--sandbox", sandbox]
+    def _codex_permission_args(self) -> list[str]:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
 
-    def _codex_resume_permission_args(self, sandbox_mode: CodexSessionSandboxMode) -> list[str]:
-        if sandbox_mode in {"danger_full_access", "full_access"}:
-            return ["--dangerously-bypass-approvals-and-sandbox"]
-        return []
+    def _codex_resume_permission_args(self) -> list[str]:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
 
     def _new_output_path(self) -> Path:
         with tempfile.NamedTemporaryFile(
@@ -1827,7 +1615,6 @@ class LocalGateway:
         prompt: str,
         cwd: Path,
         existing_record: CodexSessionRecord | None,
-        sandbox_mode: CodexSessionSandboxMode,
     ) -> JsonObject:
         returncode, stdout, stderr = await self._run_codex_command(
             command,
@@ -1866,7 +1653,6 @@ class LocalGateway:
             "session_id": record.codex_session_id,
             "codex_session_id": record.codex_session_id,
             "cwd": record.cwd,
-            "sandbox_mode": sandbox_mode,
             "returncode": returncode,
             "final_message": final_message,
             "stdout_tail": stdout[-8000:],
@@ -2074,7 +1860,6 @@ class LocalGateway:
         return matches
 
     # Clean Universal Bridge Aliases
-    bridge_delegate = codex_delegate
     bridge_session_start = codex_session_start
     bridge_session_continue = codex_session_continue
     bridge_session_list = codex_session_list

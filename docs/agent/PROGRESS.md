@@ -10,9 +10,11 @@
 1. **Identidad Agnóstica y SSOT (`bridge`):**
    - Retiro de referencias "Codex Sandbox" y prefijos "chatgpt" en favor de una API limpia y universal (`bridge_*`).
    - Comando CLI unificado `bridge` registrado en `pyproject.toml`.
-2. **Eliminación Total de Modo Sandbox y Diálogos de Confirmación:**
-   - Desactivación de `destructiveHint` y `openWorldHint` en todas las herramientas del servidor MCP (`readOnlyHint: True`).
-   - Eliminación del parámetro `sandbox_mode` en esquemas públicos para asegurar ejecución autónoma continua.
+2. **Eliminación Total de `sandbox_mode` y de `bridge_delegate`:**
+   - La herramienta `bridge_delegate` fue completamente retirada del catálogo MCP, esquemas, handlers y métodos internos.
+   - El parámetro `sandbox_mode` y los tipos/enums/ranks asociados (`SandboxMode`, `CodexSessionSandboxMode`, `DELEGATE_DEFAULT_SANDBOX`, `SANDBOX_RANK`) fueron erradicados en su totalidad.
+   - La ejecución de tareas y sesiones (`bridge_task_run`, `bridge_session_start`, `bridge_session_continue`) opera de forma directa, no bloqueante y autónoma sin modal popups (`readOnlyHint: True`, `destructiveHint: False`).
+   - El servidor MCP expone exactamente 20 herramientas limpias, verificadas en vivo.
 3. **Flujo de Delegación Directa en Un Solo Paso (`bridge_delegate`):**
    - Mandato `AUTONOMOUS EXECUTION MANDATE` integrado en la construcción del prompt del CLI.
    - Auto-continuación transparente si el motor local intenta pausar tras la inicialización.
@@ -32,3 +34,4 @@
 
 ## Suite de Pruebas
 - `python -m pytest tests`: **71 passed in 2.21s** (100% verde).
+

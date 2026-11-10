@@ -195,7 +195,6 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     }
     if gateway.config.enable_codex_tasks:
         handlers["bridge_task_run"] = gateway.bridge_task_run
-        handlers["bridge_delegate"] = gateway.bridge_delegate
         handlers["bridge_session_start"] = gateway.bridge_session_start
         handlers["bridge_session_continue"] = gateway.bridge_session_continue
         handlers["bridge_session_list"] = gateway.bridge_session_list
@@ -702,7 +701,7 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
     if tool_profile == "delegate":
         names = {"bridge_status"}
         if enable_codex_tasks:
-            names.update({"bridge_delegate", "bridge_session_list", "bridge_session_status"})
+            names.update({"bridge_task_run", "bridge_session_list", "bridge_session_status"})
         return names
     names = {
         "bridge_status",
@@ -725,7 +724,6 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
         names.update(
             {
                 "bridge_task_run",
-                "bridge_delegate",
                 "bridge_session_start",
                 "bridge_session_continue",
                 "bridge_session_list",
@@ -736,22 +734,6 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
 
 
 def _bridge_task_tool_definitions() -> list[JsonObject]:
-    delegate_permission_level = {
-        "type": "string",
-        "enum": [
-            "read_only",
-            "local_file_write",
-            "repo_edit",
-            "shell_command",
-            "gui_control",
-            "full_local",
-        ],
-        "default": "full_local",
-        "description": (
-            "The execution capability level. Defaults to full_local for direct, unhindered "
-            "execution of local commands and project tasks."
-        ),
-    }
     return [
         {
             "name": "bridge_task_run",
@@ -773,124 +755,6 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
                 },
                 "required": ["prompt", "cwd"],
                 "additionalProperties": False,
-            },
-            "annotations": {
-                "readOnlyHint": True,
-                "destructiveHint": False,
-                "openWorldHint": False,
-            },
-        },
-        {
-            "name": "bridge_delegate",
-            "title": "Delegate local task",
-            "description": (
-                "Delegate a complete local computer, file, terminal, build, test, GUI, or project "
-                "task directly to the local execution engine. Provide a concrete task, optional paths, "
-                "and expected result so the task executes directly to completion in a single operation."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 20000,
-                        "description": (
-                            "The complete local task to perform. Include concrete "
-                            "steps, file/app names, success criteria, and any user constraints."
-                        ),
-                    },
-                    "prompt": {
-                        "type": ["string", "null"],
-                        "minLength": 1,
-                        "maxLength": 20000,
-                        "default": None,
-                        "deprecated": True,
-                        "description": (
-                            "Deprecated compatibility alias for task. Prefer task for all new "
-                            "calls."
-                        ),
-                    },
-                    "permission_level": delegate_permission_level,
-                    "target_paths": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 1000,
-                            "description": "Absolute or user-relative local path in scope.",
-                        },
-                        "maxItems": 32,
-                        "default": [],
-                        "description": (
-                            "Local files or directories that may be read, written, edited, or "
-                            "used as context. Leave empty for GUI-only or broad full_local tasks."
-                        ),
-                    },
-                    "expected_result": {
-                        "type": ["string", "null"],
-                        "minLength": 1,
-                        "maxLength": 4000,
-                        "default": None,
-                        "description": (
-                            "What should be true when the task is done, for example a file exists, "
-                            "tests pass, or a local app contains specific text."
-                        ),
-                    },
-                    "cwd": {
-                        "type": ["string", "null"],
-                        "minLength": 1,
-                        "maxLength": 1000,
-                        "default": None,
-                        "description": (
-                            "Optional local working directory. Defaults to the user's "
-                            "home directory."
-                        ),
-                    },
-                    "bridge_session_id": {
-                        "type": ["string", "null"],
-                        "default": None,
-                        "description": (
-                            "Optional latest or bridge_session_id to continue."
-                        ),
-                    },
-                    "wait_timeout_s": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "maximum": 1200,
-                        "default": 600,
-                    },
-                },
-                "required": ["permission_level"],
-                "additionalProperties": False,
-            },
-            "outputSchema": {
-                "type": "object",
-                "properties": {
-                    "bridge_session_id": {"type": "string"},
-                    "session_id": {"type": ["string", "null"]},
-                    "cwd": {"type": "string"},
-                    "returncode": {"type": "integer"},
-                    "final_message": {"type": "string"},
-                    "stdout_tail": {"type": "string"},
-                    "stderr_tail": {"type": "string"},
-                    "delegation_mode": {"type": "string", "enum": ["start", "continue"]},
-                    "permission_level": delegate_permission_level,
-                    "target_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": [
-                    "bridge_session_id",
-                    "cwd",
-                    "returncode",
-                    "final_message",
-                    "delegation_mode",
-                    "permission_level",
-                    "target_paths",
-                ],
-                "additionalProperties": True,
             },
             "annotations": {
                 "readOnlyHint": True,

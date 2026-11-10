@@ -134,27 +134,17 @@ Ask ChatGPT web to review local code and delegate fixes:
 @Codex ChatGPT Bridge inspect the current repo, identify the failing test, and ask local Codex to implement the smallest fix. Run the focused tests before reporting back.
 ```
 
-Ask ChatGPT web to use Codex as a local device agent:
+Ask ChatGPT web to execute local tasks:
 
 ```text
-@Codex ChatGPT Bridge call codex_delegate with permission_level=repo_edit.
-Task: update the CLI help text, add tests, and run the test suite.
-Expected result: tests pass and the diff contains only the requested change.
-```
-
-Ask ChatGPT web to drive a local GUI task, if you explicitly enabled that level:
-
-```text
-@Codex ChatGPT Bridge call codex_delegate with permission_level=gui_control.
-Task: open TextEdit and type 你好.
-Expected result: TextEdit is open and contains the requested text.
+@Codex ChatGPT Bridge call bridge_task_run with prompt="run build and tests" cwd="C:/path/to/project".
 ```
 
 ## Modes
 
 ### Restricted Mode
 
-Restricted mode is the default. ChatGPT can only access folders the user grants:
+Restricted mode is available when you want ChatGPT to access only folders the user grants:
 
 ```bash
 codex-chatgpt-bridge grant ~/Projects/my-app --name my-app
@@ -172,15 +162,14 @@ Even inside grants, restricted mode blocks paths that look like secrets, includi
 
 ### Full Delegate Mode
 
-Full delegate mode is for a trusted personal machine where you explicitly want ChatGPT web to act as the planning brain and local Codex as the local device agent.
+Full delegate mode is for a trusted personal machine where you explicitly want ChatGPT web to act as the planning brain and local execution as the local device agent.
 
 ```bash
 codex-chatgpt-bridge set-mode full_delegate
 codex-chatgpt-bridge enable-codex-tasks
-codex-chatgpt-bridge set-tool-profile delegate
 ```
 
-In `full_delegate`, the bridge no longer requires path grants and no longer blocks sensitive-looking paths. The connector can ask the bridge to read, write, and execute anywhere the local bridge process can access. Codex session tools default to full local execution.
+In `full_delegate`, the bridge no longer requires path grants and no longer blocks sensitive-looking paths. The connector can ask the bridge to read, write, and execute anywhere the local bridge process can access. Execution tools default to full local unhindered execution.
 
 Use this only when the connector URL is private and you trust the ChatGPT session that will call it.
 
@@ -188,7 +177,6 @@ Return to safer defaults:
 
 ```bash
 codex-chatgpt-bridge set-mode restricted
-codex-chatgpt-bridge set-tool-profile full
 codex-chatgpt-bridge disable-codex-tasks
 ```
 
@@ -202,14 +190,11 @@ codex-chatgpt-bridge disable-codex-tasks
 - `search_files`: search readable grants with ripgrep.
 - `read_file`: read a UTF-8 text file inside a readable grant.
 - `write_file`: write text inside a writable grant.
-- `codex_task_run`: ask local Codex to work in an executable grant. Hidden and disabled by default.
-- `codex_delegate`: hand one structured local computer, file, shell, repo, GUI, or project task to local Codex in a single MCP call.
-- `codex_session_start`: start a persistent local Codex session for project work.
-- `codex_session_continue`: continue a recorded local Codex session.
-- `codex_session_list`: list recorded local Codex sessions.
-- `codex_session_status`: inspect one recorded local Codex session.
-
-The default tool profile is `full`, which exposes low-level file, grant, and Codex session tools. For ChatGPT web as the planning brain and local Codex as the device agent, use the `delegate` profile. It exposes one main action tool, `codex_delegate`, plus read-only status tools.
+- `bridge_task_run`: execute local tasks directly to completion.
+- `bridge_session_start`: start a persistent local session for project work.
+- `bridge_session_continue`: continue a recorded local session.
+- `bridge_session_list`: list recorded local sessions.
+- `bridge_session_status`: inspect one recorded local session.
 
 ## ChatGPT Host Limits
 
@@ -386,27 +371,17 @@ codex-chatgpt-bridge tunnel-doctor --url <connector-url> --log <tunnel-log>
 @Codex ChatGPT Bridge 检查当前 repo，找出失败测试，然后让本地 Codex 做最小修复。汇报前先运行相关测试。
 ```
 
-让 ChatGPT 网页端把 Codex 当成本地设备 agent：
+让 ChatGPT 网页端执行本地任务：
 
 ```text
-@Codex ChatGPT Bridge 调用 codex_delegate，permission_level=repo_edit。
-任务：更新 CLI help 文案、补测试、运行测试套件。
-预期结果：测试通过，diff 只包含这个请求相关的改动。
-```
-
-让 ChatGPT 网页端驱动本地 GUI，如果你明确开启了对应权限：
-
-```text
-@Codex ChatGPT Bridge 调用 codex_delegate，permission_level=gui_control。
-任务：打开 TextEdit 并输入“你好”。
-预期结果：TextEdit 已打开，并包含指定文本。
+@Codex ChatGPT Bridge 调用 bridge_task_run，prompt="运行构建与测试"，cwd="C:/path/to/project"。
 ```
 
 ## 两种模式
 
 ### Restricted 模式
 
-Restricted 是默认模式。ChatGPT 只能访问用户授权过的目录：
+Restricted 模式下，ChatGPT 只能访问用户授权过的目录：
 
 ```bash
 codex-chatgpt-bridge grant ~/Projects/my-app --name my-app
@@ -424,15 +399,14 @@ codex-chatgpt-bridge grant ~/Projects/my-app --name my-app --write --execute
 
 ### Full Delegate 模式
 
-Full delegate 用于你信任的个人机器：你明确希望 ChatGPT 网页端做总控大脑，本地 Codex 做本地设备 agent。
+Full delegate 用于你信任的个人机器：你明确希望 ChatGPT 网页端做总控大脑，本地执行做本地设备 agent。
 
 ```bash
 codex-chatgpt-bridge set-mode full_delegate
 codex-chatgpt-bridge enable-codex-tasks
-codex-chatgpt-bridge set-tool-profile delegate
 ```
 
-在 `full_delegate` 下，bridge 不再要求路径 grant，也不再拦截看起来像密钥的路径。connector 可以要求 bridge 读取、写入和执行本地 bridge 进程能访问的任何路径。Codex session 工具默认使用完整本地执行。
+在 `full_delegate` 下，bridge 不再要求路径 grant，也不再拦截看起来像密钥的路径。connector 可以要求 bridge 读取、写入和执行本地 bridge 进程能访问的任何路径。执行工具默认使用完整无限制的本地执行。
 
 只有在 connector URL 保密，并且你信任会调用它的 ChatGPT session 时才使用这个模式。
 
@@ -440,7 +414,6 @@ codex-chatgpt-bridge set-tool-profile delegate
 
 ```bash
 codex-chatgpt-bridge set-mode restricted
-codex-chatgpt-bridge set-tool-profile full
 codex-chatgpt-bridge disable-codex-tasks
 ```
 
@@ -454,14 +427,11 @@ codex-chatgpt-bridge disable-codex-tasks
 - `search_files`：用 ripgrep 搜索可读授权目录。
 - `read_file`：读取可读授权目录内的 UTF-8 文本文件。
 - `write_file`：写入可写授权目录内的文本文件。
-- `codex_task_run`：让本地 Codex 在可执行授权目录中完成任务。默认隐藏且禁用。
-- `codex_delegate`：用一次 MCP 调用，把结构化的本地电脑、文件、shell、repo、GUI 或项目任务交给本地 Codex。
-- `codex_session_start`：启动一个可持续的本地 Codex session。
-- `codex_session_continue`：继续一个已记录的本地 Codex session。
-- `codex_session_list`：列出已记录的本地 Codex session。
-- `codex_session_status`：查看某个本地 Codex session 状态。
-
-默认 tool profile 是 `full`，会暴露底层文件、授权和 Codex session 工具。如果想让 ChatGPT 网页端做总控大脑、本地 Codex 做设备 agent，使用 `delegate` profile。它主要暴露 `codex_delegate`，再加少量只读状态工具。
+- `bridge_task_run`：直接完成本地任务执行。
+- `bridge_session_start`：启动一个可持续的本地 session。
+- `bridge_session_continue`：继续一个已记录的本地 session。
+- `bridge_session_list`：列出已记录的本地 session。
+- `bridge_session_status`：查看某个本地 session 状态。
 
 ## ChatGPT 宿主限制
 

@@ -113,9 +113,9 @@ def test_codex_task_tool_requires_explicit_enable(tmp_path: Path) -> None:
     )
 
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
-    assert "bridge_task_run" in names
+    assert "bridge_delegate" not in names
     assert {
-        "bridge_delegate",
+        "bridge_task_run",
         "bridge_session_start",
         "bridge_session_continue",
         "bridge_session_list",
@@ -143,17 +143,17 @@ def test_delegate_tool_profile_exposes_single_action_tool(tmp_path: Path) -> Non
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
     assert names == {
         "bridge_status",
-        "bridge_delegate",
+        "bridge_task_run",
         "bridge_session_list",
         "bridge_session_status",
     }
 
 
-def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
+def test_bridge_tools_annotations_and_schemas_have_no_sandbox(tmp_path: Path) -> None:
     config = BridgeConfig(
         auth_token="test-token",
         enable_codex_tasks=True,
-        tool_profile="delegate",
+        tool_profile="full",
         trust_mode="full_delegate",
     )
     app = create_app(LocalGateway(config))
@@ -167,62 +167,37 @@ def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     tools = response.json()["result"]["tools"]
-    delegate_tool = next(tool for tool in tools if tool["name"] == "bridge_delegate")
-    schema = delegate_tool["inputSchema"]
-    assert schema["required"] == ["permission_level"]
-    assert schema["properties"]["prompt"]["deprecated"] is True
-    assert schema["properties"]["permission_level"]["enum"] == [
-        "read_only",
-        "local_file_write",
-        "repo_edit",
-        "shell_command",
-        "gui_control",
-        "full_local",
-    ]
-    assert "target_paths" in schema["properties"]
-    assert "expected_result" in schema["properties"]
-    assert "sandbox_mode" not in schema["properties"]
-    assert "outputSchema" in delegate_tool
-    assert delegate_tool["annotations"] == {
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "openWorldHint": False,
-    }
-    # Ensure every single tool disables confirmation prompts
-    tools = response.json()["result"]["tools"]
+    names = {t["name"] for t in tools}
+    assert "bridge_delegate" not in names
+
     for t in tools:
         assert t["annotations"]["destructiveHint"] is False
         assert t["annotations"]["openWorldHint"] is False
+        assert "sandbox_mode" not in t.get("inputSchema", {}).get("properties", {})
 
 
-def test_tools_call_codex_delegate_accepts_legacy_prompt(
+def test_tools_call_bridge_task_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = BridgeConfig(
         auth_token="test-token",
         enable_codex_tasks=True,
-        tool_profile="delegate",
+        tool_profile="full",
         trust_mode="full_delegate",
     )
     gateway = LocalGateway(config, session_store_path=tmp_path / "sessions.json")
     commands: list[list[str]] = []
 
-    async def fake_run_codex_command(
+    async def fake_run_argv(
         command: list[str],
-        output_path: Path,
-        wait_timeout_s: float,
         cwd: Path,
+        timeout_s: float,
     ) -> tuple[int, str, str]:
         commands.append(command)
-        output_path.write_text("delegated", encoding="utf-8")
-        return (
-            0,
-            '{"type":"session_configured","session_id":"019ee9e9-ecb8-72e3-a495-43674e1d7576"}\n',
-            "",
-        )
+        return (0, "task output", "")
 
-    monkeypatch.setattr(gateway, "_run_codex_command", fake_run_codex_command)
+    monkeypatch.setattr("codex_chatgpt_bridge.gateway.run_argv_captured", fake_run_argv)
     monkeypatch.setattr(gateway, "_codex_path", lambda: "/usr/local/bin/codex")
     app = create_app(gateway)
     client = TestClient(app)
@@ -235,10 +210,9 @@ def test_tools_call_codex_delegate_accepts_legacy_prompt(
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "bridge_delegate",
+                "name": "bridge_task_run",
                 "arguments": {
-                    "prompt": "legacy prompt",
-                    "permission_level": "local_file_write",
+                    "prompt": "run test task",
                     "cwd": str(tmp_path),
                 },
             },
@@ -247,9 +221,10 @@ def test_tools_call_codex_delegate_accepts_legacy_prompt(
 
     assert response.status_code == 200
     structured = response.json()["result"]["structuredContent"]
-    assert structured["final_message"] == "delegated"
-    assert structured["sandbox_mode"] == "workspace_write"
-    assert "Task:\nlegacy prompt" in commands[0][-1]
+    assert structured["returncode"] == 0
+    assert "sandbox_mode" not in structured
+    assert "--dangerously-bypass-approvals-and-sandbox" in commands[0]
+    assert commands[0][-1] == "run test task"
 
 
 def test_delegate_tool_profile_blocks_hidden_low_level_tools(tmp_path: Path) -> None:

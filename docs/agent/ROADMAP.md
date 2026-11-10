@@ -85,15 +85,31 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 **Validación:** Script exhaustivo de benchmarking concurrente y asíncrono con telemetría en vivo (`benchmark_concurrency.py`).  
 **Finaliza cuando:** Todas las ejecuciones paralelas retornen exitosamente con métricas de throughput y latencia.
 
+## Etapa 8 — Erradicación Total de `bridge_delegate` y `sandbox_mode` (SSOT, SOLID, DRY, SoC)
+- [x] Eliminar la herramienta `bridge_delegate` del catálogo, esquemas, `tool_definitions` y dispatchers en `mcp.py`.
+- [x] Eliminar `codex_delegate`, `bridge_delegate`, `_build_delegate_prompt`, `_resolve_delegate_sandbox_mode`, `DELEGATE_DEFAULT_SANDBOX` y `SANDBOX_RANK` en `gateway.py`.
+- [x] Eliminar todo parámetro y lógica de `sandbox_mode` de `codex_task_run`, `bridge_task_run`, `codex_session_start`, `bridge_session_start`, `codex_session_continue`, `bridge_session_continue`, `_finish_codex_session_run` y `_authorize_codex_cwd` en `gateway.py`.
+- [x] Limpiar referencias a `bridge_delegate` y `codex_delegate` en `bridge_messenger.py`.
+- [x] Actualizar documentación y README eliminando referencias a `codex_delegate` y `sandbox_mode`.
+- [x] Actualizar suite de pruebas (`tests/test_gateway.py` y `tests/test_mcp.py`) para reflejar la eliminación de `bridge_delegate` y `sandbox_mode`.
+- [x] Reejecutar suite completa de pytest (66 de 66 pruebas pasando al 100% verde).
+- [x] Reiniciar servidor Bridge y validar en vivo `tools/list` confirmando la erradicación de `bridge_delegate` y `sandbox_mode` (20 herramientas limpias).
+- [x] Validar ejecución en vivo de `bridge_task_run` contra el daemon en ejecución con resultado verificado (returncode 0).
+
+**Validación:** `pytest` pasando al 100% + búsqueda global de `bridge_delegate` y `sandbox_mode` confirmando 0 ocurrencias en código ejecutable.  
+**Finaliza cuando:** La arquitectura quede limpia, con tipado estricto, sin vestigios de sandbox ni de delegate tool.
+
 ## Evidencia de validación
 | Validación | Comando | Resultado |
 |---|---|---|
-| Suite de Pruebas | `python -m pytest tests` | **71 passed in 2.21s** (100% verde) |
-| Eliminación de Sandbox | `tools/list` en `/mcp` | `bridge_delegate` y `bridge_task_run` **sin `sandbox_mode`** |
+| Suite de Pruebas | `python -m pytest tests` | **66 passed in 3.26s** (100% verde) |
+| Erradicación de `bridge_delegate` | `tools/list` en `/mcp` | **`bridge_delegate` inexistente** (20 herramientas totales) |
+| Erradicación de `sandbox_mode` | `tools/list` en `/mcp` | **0 herramientas con `sandbox_mode`** |
+| Ejecución en Vivo de Tarea | `bridge_task_run` en vivo | **Exit 0, sin `sandbox_mode`, sin diálogos** |
 | Detección de Ripgrep | `bridge_status` en `/mcp` | `ripgrep_available: True`, `search_engine: ripgrep` |
-| Ráfaga MCP Concurrente | `benchmark_concurrency.py` (Escenario 1) | **50/50 llamadas en 1.675s (29.85 req/s)** |
-| I/O Paralelo de Archivos | `benchmark_concurrency.py` (Escenario 2) | **20 escrituras (0.134s), 20 lecturas (0.098s), 20 ediciones (0.136s)** |
-| Búsquedas Ripgrep Paralelas | `benchmark_concurrency.py` (Escenario 3) | **10 búsquedas en 0.411s (392ms latencia media)** |
-| Procesos del SO Paralelos | `benchmark_concurrency.py` (Escenario 4) | **8 procesos en 1.044s (8 PIDs únicos, salidas aisladas)** |
+| Ráfaga MCP Concurrente | `benchmark_concurrency.py` (Escenario 1) | **50/50 llamadas en 2.84s (100% éxito)** |
+| I/O Paralelo de Archivos | `benchmark_concurrency.py` (Escenario 2) | **20 escrituras (0.218s), 20 lecturas (0.158s), 20 ediciones (0.250s)** |
+| Búsquedas Ripgrep Paralelas | `benchmark_concurrency.py` (Escenario 3) | **10 búsquedas en 0.648s** |
+| Procesos del SO Paralelos | `benchmark_concurrency.py` (Escenario 4) | **8 procesos en 1.184s (8 PIDs únicos aislados)** |
 | Background Jobs Asíncronos | `benchmark_concurrency.py` (Escenario 5) | **4 jobs concurrentes rastreados por Process Manager** |
-| Consultas de Sesión Paralelas| `benchmark_concurrency.py` (Escenario 6) | **20 consultas en 0.114s sin contención** |
+| Consultas de Sesión Paralelas| `benchmark_concurrency.py` (Escenario 6) | **20 consultas en 0.145s sin contención** |

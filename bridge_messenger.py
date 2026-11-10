@@ -497,13 +497,11 @@ class TuiRenderer:
         "list_dir": "List",
         "file_ops": "FileOps",
         "bridge_status": "Status",
-        "bridge_delegate": "Delegate",
         "bridge_task_run": "Task",
         "bridge_session_start": "Session",
         "bridge_session_continue": "Session",
         "bridge_session_list": "Sessions",
         "bridge_session_status": "Session",
-        "codex_delegate": "Delegate",
         "codex_task_run": "Task",
         "system_info": "SysInfo",
     }
