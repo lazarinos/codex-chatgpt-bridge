@@ -11,7 +11,7 @@ from codex_chatgpt_bridge.mcp import create_app
 
 
 def test_tools_list_includes_core_tools(tmp_path: Path) -> None:
-    config = BridgeConfig(auth_token="test-token", grants=[BridgeGrant(path=tmp_path)])
+    config = BridgeConfig(auth_token="test-token", enable_codex_tasks=False, grants=[BridgeGrant(path=tmp_path)])
     app = create_app(LocalGateway(config))
     client = TestClient(app)
 
@@ -33,7 +33,7 @@ def test_tools_list_includes_core_tools(tmp_path: Path) -> None:
         "read_file",
         "write_file",
     } <= names
-    assert "codex_task_run" not in names
+    assert "bridge_task_run" not in names
 
 
 def test_tools_list_requires_bearer_token(tmp_path: Path) -> None:
@@ -113,13 +113,13 @@ def test_codex_task_tool_requires_explicit_enable(tmp_path: Path) -> None:
     )
 
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
-    assert "codex_task_run" in names
+    assert "bridge_task_run" in names
     assert {
-        "codex_delegate",
-        "codex_session_start",
-        "codex_session_continue",
-        "codex_session_list",
-        "codex_session_status",
+        "bridge_delegate",
+        "bridge_session_start",
+        "bridge_session_continue",
+        "bridge_session_list",
+        "bridge_session_status",
     } <= names
 
 
@@ -143,9 +143,9 @@ def test_delegate_tool_profile_exposes_single_action_tool(tmp_path: Path) -> Non
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
     assert names == {
         "bridge_status",
-        "codex_delegate",
-        "codex_session_list",
-        "codex_session_status",
+        "bridge_delegate",
+        "bridge_session_list",
+        "bridge_session_status",
     }
 
 
@@ -167,7 +167,7 @@ def test_codex_delegate_schema_uses_structured_scope(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     tools = response.json()["result"]["tools"]
-    delegate_tool = next(tool for tool in tools if tool["name"] == "codex_delegate")
+    delegate_tool = next(tool for tool in tools if tool["name"] == "bridge_delegate")
     schema = delegate_tool["inputSchema"]
     assert schema["required"] == ["permission_level"]
     assert schema["properties"]["prompt"]["deprecated"] is True
@@ -235,7 +235,7 @@ def test_tools_call_codex_delegate_accepts_legacy_prompt(
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "codex_delegate",
+                "name": "bridge_delegate",
                 "arguments": {
                     "prompt": "legacy prompt",
                     "permission_level": "local_file_write",

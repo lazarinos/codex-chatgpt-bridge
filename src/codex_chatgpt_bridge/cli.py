@@ -43,13 +43,13 @@ def main() -> None:
         _cmd_set_mode(args)
     elif args.command == "set-tool-profile":
         _cmd_set_tool_profile(args)
-    elif args.command == "enable-codex-tasks":
+    elif args.command in {"enable-tasks", "enable-codex-tasks"}:
         _cmd_set_codex_tasks(args, enabled=True)
-    elif args.command == "disable-codex-tasks":
+    elif args.command in {"disable-tasks", "disable-codex-tasks"}:
         _cmd_set_codex_tasks(args, enabled=False)
     elif args.command == "install-launch-agent":
         _cmd_install_launch_agent(args)
-    elif args.command == "print-chatgpt-setup":
+    elif args.command in {"print-setup", "print-chatgpt-setup"}:
         _cmd_print_chatgpt_setup(args)
     elif args.command == "tunnel-doctor":
         _cmd_tunnel_doctor(args)
@@ -59,8 +59,8 @@ def main() -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="codex-chatgpt-bridge",
-        description="Install and run a local bridge between ChatGPT web sessions and local Codex.",
+        prog="bridge",
+        description="Universal local MCP bridge for AI agents (Gemini, Claude, ChatGPT, etc.).",
     )
     parser.add_argument("--config", type=Path, default=default_config_path())
     subparsers = parser.add_subparsers(dest="command")
@@ -86,30 +86,37 @@ def _build_parser() -> argparse.ArgumentParser:
 
     profile = subparsers.add_parser(
         "set-tool-profile",
-        help="Set full or delegate tool profile for ChatGPT",
+        help="Set full or delegate tool profile for AI agents",
     )
     profile.add_argument("profile", choices=["full", "delegate"])
 
-    subparsers.add_parser(
-        "enable-codex-tasks",
-        help="Expose codex_task_run after the user understands the local execution risk",
-    )
-    subparsers.add_parser("disable-codex-tasks", help="Hide and disable codex_task_run")
+    subparsers.add_parser("enable-tasks", help="Enable execution task tools")
+    subparsers.add_parser("enable-codex-tasks", help="Compatibility alias for enable-tasks")
+    subparsers.add_parser("disable-tasks", help="Disable execution task tools")
+    subparsers.add_parser("disable-codex-tasks", help="Compatibility alias for disable-tasks")
 
     launch = subparsers.add_parser("install-launch-agent", help="Install a macOS launchd service")
-    launch.add_argument("--label", default="com.codex-chatgpt-bridge")
+    launch.add_argument("--label", default="com.bridge")
     launch.add_argument(
         "--load",
         action="store_true",
         help="Load and start the service after writing it",
     )
 
-    setup = subparsers.add_parser("print-chatgpt-setup", help="Print ChatGPT connector setup text")
+    setup = subparsers.add_parser("print-setup", help="Print AI connector setup text")
     setup.add_argument("--url", default="http://127.0.0.1:8766/mcp")
     setup.add_argument(
         "--show-token",
         action="store_true",
-        help="Print the local bearer token needed by ChatGPT connector setup",
+        help="Print the local bearer token needed by connector setup",
+    )
+
+    legacy_setup = subparsers.add_parser("print-chatgpt-setup", help="Compatibility alias for print-setup")
+    legacy_setup.add_argument("--url", default="http://127.0.0.1:8766/mcp")
+    legacy_setup.add_argument(
+        "--show-token",
+        action="store_true",
+        help="Print the local bearer token needed by connector setup",
     )
 
     tunnel_doctor = subparsers.add_parser(
@@ -143,7 +150,7 @@ def _cmd_init(args: argparse.Namespace) -> None:
         )
     path = save_config(new_cfg, args.config)
     print(f"Created secure empty config: {path}")
-    print("Next: codex-chatgpt-bridge grant ~/Projects --write --execute")
+    print("Next: bridge grant ~/Projects --write --execute")
 
 
 def _cmd_grant(args: argparse.Namespace) -> None:
@@ -269,27 +276,27 @@ def _cmd_set_tool_profile(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     profile: ToolProfile = args.profile
     save_config(config.model_copy(update={"tool_profile": profile}), args.config)
-    print(f"Set ChatGPT tool profile: {profile}")
+    print(f"Set tool profile: {profile}")
     if profile == "delegate":
-        print("delegate exposes one primary Codex delegation tool plus read-only status tools.")
+        print("delegate exposes one primary delegation tool plus read-only status tools.")
 
 
 def _cmd_set_codex_tasks(args: argparse.Namespace, *, enabled: bool) -> None:
     config = load_config(args.config)
     save_config(config.model_copy(update={"enable_codex_tasks": enabled}), args.config)
     if enabled:
-        print("Enabled Codex delegation tools. Only executable grants may run local Codex.")
+        print("Enabled delegation tools.")
     else:
-        print("Disabled Codex delegation tools.")
+        print("Disabled delegation tools.")
 
 
 def _cmd_install_launch_agent(args: argparse.Namespace) -> None:
     if platform.system() != "Darwin":
         raise SystemExit("install-launch-agent currently supports macOS launchd only")
-    executable = shutil.which("codex-chatgpt-bridge") or str(Path(sys.argv[0]).resolve())
+    executable = shutil.which("bridge") or shutil.which("codex-chatgpt-bridge") or str(Path(sys.argv[0]).resolve())
     label = str(args.label)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    log_dir = Path.home() / "Library" / "Logs" / "codex-chatgpt-bridge"
+    log_dir = Path.home() / "Library" / "Logs" / "bridge"
     log_dir.mkdir(parents=True, exist_ok=True)
     plist = {
         "Label": label,
@@ -332,33 +339,25 @@ def _cmd_print_chatgpt_setup(args: argparse.Namespace) -> None:
         else "Bearer token: stored in config; rerun with --show-token to display it locally."
     )
     connector_url_line = (
-        f"ChatGPT no-auth connector URL: {connector_url}"
+        f"Connector no-auth URL: {connector_url}"
         if args.show_token
         else (
-            "ChatGPT no-auth connector URL: stored in config; rerun with "
+            "Connector no-auth URL: stored in config; rerun with "
             "--show-token to display it locally."
         )
     )
     print(
         "\n".join(
             [
-                "ChatGPT connector setup",
-                "1. Start the bridge: codex-chatgpt-bridge run",
-                "2. ChatGPT web needs a stable HTTPS tunnel for local MCP. Prefer "
-                "OpenAI Secure MCP Tunnel.",
-                "3. If Secure MCP Tunnel is not available, use a named Cloudflare Tunnel "
-                "or another stable HTTPS endpoint you control.",
-                "4. Do not treat a trycloudflare.com quick tunnel as a stable install target; "
-                "it is not a stable install target and is useful only for short smoke tests.",
-                f"5. Bearer-protected MCP URL: {safe_bearer_url}",
-                f"6. {connector_url_line}",
-                "7. If ChatGPT only offers OAuth / unauthenticated / mixed auth, "
-                "use the no-auth connector URL and keep it private.",
-                "8. If ChatGPT supports HTTP Bearer / API key bearer, use the "
-                "bearer-protected URL and paste the local token.",
-                f"9. {token_line}",
-                "10. In any ChatGPT conversation, mention the connector and ask it to "
-                "list_grants first.",
+                "Bridge connector setup",
+                "1. Start the bridge: bridge run",
+                "2. AI web clients need an HTTPS tunnel for remote MCP connections.",
+                "3. Use Cloudflare Tunnel, ngrok, or another HTTPS endpoint you control.",
+                f"4. Bearer-protected MCP URL: {safe_bearer_url}",
+                f"5. {connector_url_line}",
+                "6. If the client supports HTTP Bearer, use the bearer-protected URL and paste the token.",
+                f"7. {token_line}",
+                "8. In any AI conversation (Gemini, Claude, ChatGPT, etc.), connect to this bridge.",
             ]
         )
     )

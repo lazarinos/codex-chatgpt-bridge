@@ -1,4 +1,4 @@
-"""Minimal HTTP MCP-compatible server for ChatGPT connectors."""
+"""Minimal HTTP MCP-compatible server for AI agents and model connectors."""
 
 from __future__ import annotations
 
@@ -98,14 +98,14 @@ class LiveInboxMessageRequest(BaseModel):
 def create_app(gateway: LocalGateway) -> FastAPI:
     """Create the FastAPI app."""
 
-    app = FastAPI(title="Codex ChatGPT Bridge", version="0.2.0")
+    app = FastAPI(title="Bridge MCP Server", version="0.5.0")
 
     @app.get("/healthz")
     async def healthz() -> JsonObject:
         return {
             "status": "ok",
-            "server": "codex-chatgpt-bridge",
-            "version": "0.4.0",
+            "server": "bridge",
+            "version": "0.5.0",
             "unread_user_messages": len(gateway._inbox_store.peek_unread_for_agent()),
             "parallel_engine": get_parallel_telemetry(gateway),
         }
@@ -194,12 +194,12 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
         "system_info": gateway.system_info,
     }
     if gateway.config.enable_codex_tasks:
-        handlers["codex_task_run"] = gateway.codex_task_run
-        handlers["codex_delegate"] = gateway.codex_delegate
-        handlers["codex_session_start"] = gateway.codex_session_start
-        handlers["codex_session_continue"] = gateway.codex_session_continue
-        handlers["codex_session_list"] = gateway.codex_session_list
-        handlers["codex_session_status"] = gateway.codex_session_status
+        handlers["bridge_task_run"] = gateway.bridge_task_run
+        handlers["bridge_delegate"] = gateway.bridge_delegate
+        handlers["bridge_session_start"] = gateway.bridge_session_start
+        handlers["bridge_session_continue"] = gateway.bridge_session_continue
+        handlers["bridge_session_list"] = gateway.bridge_session_list
+        handlers["bridge_session_status"] = gateway.bridge_session_status
     visible_names = visible_tool_names(
         gateway.config.enable_codex_tasks,
         tool_profile=gateway.config.tool_profile,
@@ -292,7 +292,7 @@ async def _handle_mcp_request(
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "codex-chatgpt-bridge", "version": "0.2.0"},
+                "serverInfo": {"name": "bridge", "version": "0.5.0"},
             }
         elif request.method in {"notifications/initialized", "ping"}:
             result = {}
@@ -311,7 +311,7 @@ def tool_definitions(
     auth_mode: str = "bearer",
     tool_profile: ToolProfile = "full",
 ) -> list[JsonObject]:
-    """Return tool schemas visible to ChatGPT."""
+    """Return tool schemas visible to AI agents."""
 
     tools: list[JsonObject] = [
         {
@@ -677,7 +677,7 @@ def tool_definitions(
         },
     ]
     if enable_codex_tasks:
-        tools.extend(_codex_tool_definitions())
+        tools.extend(_bridge_task_tool_definitions())
     names = visible_tool_names(enable_codex_tasks, tool_profile=tool_profile)
     tools = [tool for tool in tools if tool["name"] in names]
     for tool in tools:
@@ -689,20 +689,20 @@ def tool_definitions(
         tool["securitySchemes"] = security_schemes
         tool["_meta"] = {
             "securitySchemes": security_schemes,
-            "openai/visibility": "public",
-            "openai/toolInvocation/invoking": f"Running {tool['name']}",
-            "openai/toolInvocation/invoked": f"{tool['name']} finished",
+            "visibility": "public",
+            "toolInvocation/invoking": f"Running {tool['name']}",
+            "toolInvocation/invoked": f"{tool['name']} finished",
         }
     return tools
 
 
 def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = "full") -> set[str]:
-    """Return the tool names visible to ChatGPT for the selected profile."""
+    """Return the tool names visible to the AI agent for the selected profile."""
 
     if tool_profile == "delegate":
         names = {"bridge_status"}
         if enable_codex_tasks:
-            names.update({"codex_delegate", "codex_session_list", "codex_session_status"})
+            names.update({"bridge_delegate", "bridge_session_list", "bridge_session_status"})
         return names
     names = {
         "bridge_status",
@@ -724,33 +724,29 @@ def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = 
     if enable_codex_tasks:
         names.update(
             {
-                "codex_task_run",
-                "codex_delegate",
-                "codex_session_start",
-                "codex_session_continue",
-                "codex_session_list",
-                "codex_session_status",
+                "bridge_task_run",
+                "bridge_delegate",
+                "bridge_session_start",
+                "bridge_session_continue",
+                "bridge_session_list",
+                "bridge_session_status",
             }
         )
     return names
 
 
-def _codex_tool_definitions() -> list[JsonObject]:
-    codex_session_sandbox = {
+def _bridge_task_tool_definitions() -> list[JsonObject]:
+    bridge_session_sandbox = {
         "type": "string",
-        "enum": ["read_only", "workspace_write", "danger_full_access"],
-        "default": "danger_full_access",
+        "enum": ["full_access", "workspace_write", "read_only", "danger_full_access"],
+        "default": "full_access",
+        "description": "Execution access mode. Defaults to full_access for direct execution.",
     }
-    codex_delegate_sandbox = {
+    bridge_delegate_sandbox = {
         "type": ["string", "null"],
-        "enum": ["read_only", "workspace_write", "danger_full_access", None],
+        "enum": ["full_access", "workspace_write", "read_only", "danger_full_access", None],
         "default": None,
-        "description": (
-            "Optional override for the local Codex sandbox. Leave unset to derive it from "
-            "permission_level: read_only -> read_only, local_file_write/repo_edit -> "
-            "workspace_write, shell_command/gui_control/full_local -> danger_full_access. "
-            "The bridge rejects a sandbox that exceeds permission_level."
-        ),
+        "description": "Optional execution mode override.",
     }
     delegate_permission_level = {
         "type": "string",
@@ -762,20 +758,18 @@ def _codex_tool_definitions() -> list[JsonObject]:
             "gui_control",
             "full_local",
         ],
+        "default": "full_local",
         "description": (
-            "The maximum local capability this delegated task may use. It also sets the "
-            "default sandbox unless sandbox_mode is explicitly provided. Use read_only for "
-            "inspection, local_file_write for specific file writes, repo_edit for project "
-            "changes, shell_command for terminal commands, gui_control for local app UI, "
-            "and full_local only when the user explicitly asked for broad local control."
+            "The execution capability level. Defaults to full_local for direct, unhindered "
+            "execution of local commands and project tasks."
         ),
     }
     return [
         {
-            "name": "codex_task_run",
-            "title": "Run local Codex task",
+            "name": "bridge_task_run",
+            "title": "Run local task",
             "description": (
-                "Hand one bounded task to local Codex in an approved executable directory."
+                "Execute one bounded task directly in an approved local directory."
             ),
             "inputSchema": {
                 "type": "object",
@@ -784,8 +778,8 @@ def _codex_tool_definitions() -> list[JsonObject]:
                     "cwd": {"type": "string", "minLength": 1, "maxLength": 1000},
                     "sandbox_mode": {
                         "type": "string",
-                        "enum": ["read_only", "workspace_write"],
-                        "default": "read_only",
+                        "enum": ["full_access", "read_only", "workspace_write", "danger_full_access"],
+                        "default": "full_access",
                     },
                     "wait_timeout_s": {
                         "type": "number",
@@ -804,13 +798,12 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
         },
         {
-            "name": "codex_delegate",
-            "title": "Delegate to local Codex",
+            "name": "bridge_delegate",
+            "title": "Delegate local task",
             "description": (
-                "Use this only when the user explicitly asks ChatGPT to delegate one local "
-                "computer, file, shell, repo, GUI, or project task to local Codex. Provide "
-                "a concrete task, the requested permission level, affected local paths when "
-                "known, and the expected result so ChatGPT can review the scope in one call."
+                "Delegate a complete local computer, file, terminal, build, test, GUI, or project "
+                "task directly to the local execution engine. Provide a concrete task, optional paths, "
+                "and expected result so the task executes directly."
             ),
             "inputSchema": {
                 "type": "object",
@@ -820,7 +813,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                         "minLength": 1,
                         "maxLength": 20000,
                         "description": (
-                            "The complete local task for Codex to perform. Include concrete "
+                            "The complete local task to perform. Include concrete "
                             "steps, file/app names, success criteria, and any user constraints."
                         ),
                     },
@@ -857,7 +850,7 @@ def _codex_tool_definitions() -> list[JsonObject]:
                         "maxLength": 4000,
                         "default": None,
                         "description": (
-                            "What should be true when Codex is done, for example a file exists, "
+                            "What should be true when the task is done, for example a file exists, "
                             "tests pass, or a local app contains specific text."
                         ),
                     },
@@ -875,10 +868,10 @@ def _codex_tool_definitions() -> list[JsonObject]:
                         "type": ["string", "null"],
                         "default": None,
                         "description": (
-                            "Optional latest, bridge_session_id, or Codex session id to continue."
+                            "Optional latest or bridge_session_id to continue."
                         ),
                     },
-                    "sandbox_mode": codex_delegate_sandbox,
+                    "sandbox_mode": bridge_delegate_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -893,12 +886,9 @@ def _codex_tool_definitions() -> list[JsonObject]:
                 "type": "object",
                 "properties": {
                     "bridge_session_id": {"type": "string"},
-                    "codex_session_id": {"type": ["string", "null"]},
+                    "session_id": {"type": ["string", "null"]},
                     "cwd": {"type": "string"},
-                    "sandbox_mode": {
-                        "type": "string",
-                        "enum": ["read_only", "workspace_write", "danger_full_access"],
-                    },
+                    "sandbox_mode": {"type": "string"},
                     "returncode": {"type": "integer"},
                     "final_message": {"type": "string"},
                     "stdout_tail": {"type": "string"},
@@ -929,18 +919,18 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
         },
         {
-            "name": "codex_session_start",
-            "title": "Start local Codex session",
+            "name": "bridge_session_start",
+            "title": "Start local session",
             "description": (
-                "Start a persistent local Codex session. Use this as the main execution path "
-                "when ChatGPT needs local project changes, command execution, tests, or repo work."
+                "Start a persistent local session for project changes, command execution, "
+                "tests, or repo work."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "minLength": 1, "maxLength": 20000},
                     "cwd": {"type": "string", "minLength": 1, "maxLength": 1000},
-                    "sandbox_mode": codex_session_sandbox,
+                    "sandbox_mode": bridge_session_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -958,9 +948,9 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
         },
         {
-            "name": "codex_session_continue",
-            "title": "Continue local Codex session",
-            "description": "Send a follow-up prompt to a persisted local Codex session.",
+            "name": "bridge_session_continue",
+            "title": "Continue local session",
+            "description": "Send a follow-up prompt to a persistent local session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -968,9 +958,9 @@ def _codex_tool_definitions() -> list[JsonObject]:
                     "bridge_session_id": {
                         "type": "string",
                         "default": "latest",
-                        "description": "Use latest, a bridge_session_id, or a Codex session id.",
+                        "description": "Use latest or a bridge_session_id.",
                     },
-                    "sandbox_mode": codex_session_sandbox,
+                    "sandbox_mode": bridge_session_sandbox,
                     "wait_timeout_s": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -988,16 +978,16 @@ def _codex_tool_definitions() -> list[JsonObject]:
             },
         },
         {
-            "name": "codex_session_list",
-            "title": "List local Codex sessions",
-            "description": "List persistent local Codex sessions known to the bridge.",
+            "name": "bridge_session_list",
+            "title": "List local sessions",
+            "description": "List persistent local sessions known to the bridge.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
         },
         {
-            "name": "codex_session_status",
-            "title": "Get local Codex session status",
-            "description": "Return metadata for a persisted local Codex session.",
+            "name": "bridge_session_status",
+            "title": "Get local session status",
+            "description": "Return metadata for a persistent local session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

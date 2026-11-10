@@ -1,4 +1,4 @@
-"""Non-interrupting Live User-to-Agent Message Queue for Codex ChatGPT Bridge."""
+"""Non-interrupting Live User-to-Agent Message Queue for Bridge."""
 
 from __future__ import annotations
 
@@ -29,7 +29,12 @@ _SILENT_ACTIVITY_PREFIXES = (
 
 def default_inbox_path(config_path: Path | None = None) -> Path:
     """Return the path to the persistent live inbox JSON file."""
-    base_dir = config_path.parent if config_path is not None else (Path.home() / ".codex-chatgpt-bridge")
+    if config_path is not None:
+        base_dir = config_path.parent
+    else:
+        primary = Path.home() / ".bridge"
+        legacy = Path.home() / ".codex-chatgpt-bridge"
+        base_dir = legacy if not primary.exists() and legacy.exists() else primary
     base_dir.mkdir(parents=True, exist_ok=True)
     return base_dir / "live_inbox.json"
 

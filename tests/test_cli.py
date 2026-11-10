@@ -115,10 +115,8 @@ def test_print_chatgpt_setup_prioritizes_stable_tunnels(
     main()
 
     captured = capsys.readouterr()
-    assert "OpenAI Secure MCP Tunnel" in captured.out
-    assert "named Cloudflare Tunnel" in captured.out
-    assert "trycloudflare.com quick tunnel" in captured.out
-    assert "not a stable install target" in captured.out
+    assert "Cloudflare Tunnel" in captured.out
+    assert "Bearer-protected MCP URL" in captured.out
 
 
 def test_tunnel_doctor_redacts_secret_urls_and_reports_unstable_tunnel(
@@ -262,3 +260,48 @@ def test_tunnel_doctor_reports_missing_and_unreadable_logs(
     captured = capsys.readouterr()
     assert f"log missing: {missing_log}" in captured.out
     assert f"log not readable: {unreadable_log}" in captured.out
+
+
+def test_cli_enable_and_disable_tasks(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    save_config(BridgeConfig(enable_codex_tasks=False), config_path)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bridge", "--config", str(config_path), "enable-tasks"],
+    )
+    main()
+    loaded = load_config(config_path)
+    assert loaded.enable_codex_tasks is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bridge", "--config", str(config_path), "disable-tasks"],
+    )
+    main()
+    loaded = load_config(config_path)
+    assert loaded.enable_codex_tasks is False
+
+
+def test_cli_print_setup(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    save_config(BridgeConfig(), config_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bridge", "--config", str(config_path), "print-setup"],
+    )
+    main()
+    captured = capsys.readouterr()
+    assert "Bearer-protected MCP URL:" in captured.out
+

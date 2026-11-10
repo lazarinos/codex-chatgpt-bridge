@@ -38,6 +38,7 @@ dev = [
 ]
 
 [project.scripts]
+bridge = "codex_chatgpt_bridge.cli:main"
 codex-chatgpt-bridge = "codex_chatgpt_bridge.cli:main"
 
 [tool.hatch.build.targets.wheel]

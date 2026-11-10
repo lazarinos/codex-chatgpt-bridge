@@ -79,10 +79,20 @@ class CodexSessionStore:
         self._path.chmod(0o600)
 
 
+BridgeSessionRecord = CodexSessionRecord
+BridgeSessionStore = CodexSessionStore
+
+
 def default_session_store_path(config_path: Path) -> Path:
     """Return the session store path next to the bridge config."""
 
-    return config_path.parent / "codex_sessions.json"
+    primary = config_path.parent / "sessions.json"
+    if primary.exists():
+        return primary
+    legacy = config_path.parent / "codex_sessions.json"
+    if legacy.exists():
+        return legacy
+    return primary
 
 
 def extract_codex_session_id(stdout: str) -> str | None:
@@ -126,3 +136,6 @@ def _find_uuid_in_json(value: Any) -> str | None:
             if found:
                 return found
     return None
+
+
+extract_session_id = extract_codex_session_id

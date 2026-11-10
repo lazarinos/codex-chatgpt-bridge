@@ -40,8 +40,9 @@ from .live_inbox import LiveInboxStore, default_inbox_path
 from .process_runner import BackgroundJobManager, ShellKind, kill_process_tree, run_argv_captured
 from .security import is_relative_to, is_sensitive_path, resolve_user_path
 
-SandboxMode = Literal["read_only", "workspace_write"]
-CodexSessionSandboxMode = Literal["read_only", "workspace_write", "danger_full_access"]
+SandboxMode = Literal["full_access", "read_only", "workspace_write", "danger_full_access"]
+CodexSessionSandboxMode = Literal["full_access", "read_only", "workspace_write", "danger_full_access"]
+BridgeSessionSandboxMode = CodexSessionSandboxMode
 DelegatePermissionLevel = Literal[
     "read_only",
     "local_file_write",
@@ -92,6 +93,7 @@ DELEGATE_DEFAULT_SANDBOX: dict[str, CodexSessionSandboxMode] = {
 SANDBOX_RANK: dict[str, int] = {
     "read_only": 0,
     "workspace_write": 1,
+    "full_access": 2,
     "danger_full_access": 2,
 }
 _IGNORED_SEARCH_DIRS: set[str] = {
@@ -218,6 +220,7 @@ class LocalGateway:
             "tool_profile": self._config.tool_profile,
             "grant_count": len(self._config.grants),
             "auth_required": True,
+            "tasks_enabled": self._config.enable_codex_tasks,
             "codex_tasks_enabled": self._config.enable_codex_tasks,
             "active_background_jobs": sum(
                 1 for job in self._job_manager.list_jobs() if job["status"] == "running"
@@ -260,9 +263,9 @@ class LocalGateway:
                 "bridge_status",
                 *(
                     [
-                        "codex_delegate",
-                        "codex_session_list",
-                        "codex_session_status",
+                        "bridge_delegate",
+                        "bridge_session_list",
+                        "bridge_session_status",
                     ]
                     if self._config.enable_codex_tasks
                     else []
@@ -284,14 +287,14 @@ class LocalGateway:
             "exec_command",
             "process_manager",
             "system_info",
-            *(["codex_task_run"] if self._config.enable_codex_tasks else []),
+            *(["bridge_task_run"] if self._config.enable_codex_tasks else []),
             *(
                 [
-                    "codex_delegate",
-                    "codex_session_start",
-                    "codex_session_continue",
-                    "codex_session_list",
-                    "codex_session_status",
+                    "bridge_delegate",
+                    "bridge_session_start",
+                    "bridge_session_continue",
+                    "bridge_session_list",
+                    "bridge_session_status",
                 ]
                 if self._config.enable_codex_tasks
                 else []
@@ -1547,7 +1550,7 @@ class LocalGateway:
             return default_sandbox
         if sandbox_mode not in SANDBOX_RANK:
             raise BridgeError(
-                "sandbox_mode must be read_only, workspace_write, or danger_full_access"
+                "sandbox_mode must be full_access, read_only, workspace_write, or danger_full_access"
             )
         if SANDBOX_RANK[sandbox_mode] > SANDBOX_RANK[default_sandbox]:
             raise BridgeError(
@@ -1566,7 +1569,7 @@ class LocalGateway:
         path_block = (
             "\n".join(f"- {path}" for path in target_paths)
             if target_paths
-            else "Not specified by ChatGPT."
+            else "Not specified by caller."
         )
         result_block = (
             expected_result.strip()
@@ -1575,7 +1578,7 @@ class LocalGateway:
         )
         return "\n\n".join(
             [
-                "You are local Codex executing a task delegated from ChatGPT web.",
+                "You are the local execution engine performing a task delegated from the remote AI agent.",
                 "Act as the local device agent for this machine.",
                 f"Permission level: {permission_level}",
                 f"Target paths:\n{path_block}",
@@ -1657,40 +1660,43 @@ class LocalGateway:
         *,
         prompt: str,
         cwd: str,
-        sandbox_mode: SandboxMode = "read_only",
+        sandbox_mode: SandboxMode = "full_access",
         wait_timeout_s: float = 120.0,
     ) -> JsonObject:
-        """Run a bounded local Codex task in an approved executable directory."""
+        """Run a bounded local task in an approved executable directory."""
 
         self._maybe_reload_config()
         if not self._config.enable_codex_tasks:
             raise BridgeError(
-                "codex_task_run is disabled; enable it explicitly in the bridge config"
+                "task tools are disabled; enable tasks in the bridge config"
             )
         if not prompt.strip():
             raise BridgeError("prompt must not be empty")
-        if sandbox_mode not in {"read_only", "workspace_write"}:
-            raise BridgeError("sandbox_mode must be read_only or workspace_write")
+        if sandbox_mode not in {"full_access", "danger_full_access", "read_only", "workspace_write"}:
+            raise BridgeError("sandbox_mode must be full_access, danger_full_access, read_only, or workspace_write")
         resolved_cwd = self._authorize(cwd, read=True, execute=True)
-        if sandbox_mode == "workspace_write":
+        if sandbox_mode in {"full_access", "danger_full_access", "workspace_write"}:
             self._authorize(str(resolved_cwd), write=True)
         codex_path = shutil.which("codex")
         if codex_path is None:
             raise BridgeError("codex CLI was not found on PATH")
         with tempfile.NamedTemporaryFile(
-            prefix="codex-chatgpt-bridge-",
+            prefix="bridge-",
             suffix=".txt",
             delete=False,
         ) as handle:
             output_path = Path(handle.name)
-        sandbox = "workspace-write" if sandbox_mode == "workspace_write" else "read-only"
+        if sandbox_mode in {"full_access", "danger_full_access"}:
+            sandbox_args = ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            sandbox = "workspace-write" if sandbox_mode == "workspace_write" else "read-only"
+            sandbox_args = ["--sandbox", sandbox]
         command = [
             codex_path,
             "exec",
             "--cd",
             str(resolved_cwd),
-            "--sandbox",
-            sandbox,
+            *sandbox_args,
             "--output-last-message",
             str(output_path),
             prompt,
@@ -1703,7 +1709,7 @@ class LocalGateway:
             )
         except TimeoutError as exc:
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
-            raise BridgeError(f"codex task timed out after {wait_timeout_s} seconds") from exc
+            raise BridgeError(f"task timed out after {wait_timeout_s} seconds") from exc
 
         final_message = ""
         if output_path.exists():
@@ -1723,12 +1729,12 @@ class LocalGateway:
         }
 
     def _authorize_codex_cwd(self, cwd: str, sandbox_mode: CodexSessionSandboxMode) -> Path:
-        if sandbox_mode not in {"read_only", "workspace_write", "danger_full_access"}:
+        if sandbox_mode not in {"full_access", "read_only", "workspace_write", "danger_full_access"}:
             raise BridgeError(
-                "sandbox_mode must be read_only, workspace_write, or danger_full_access"
+                "sandbox_mode must be full_access, read_only, workspace_write, or danger_full_access"
             )
         resolved_cwd = self._authorize(cwd, read=True, execute=True)
-        if sandbox_mode in {"workspace_write", "danger_full_access"}:
+        if sandbox_mode in {"full_access", "workspace_write", "danger_full_access"}:
             self._authorize(str(resolved_cwd), write=True)
         return resolved_cwd
 
@@ -1739,19 +1745,19 @@ class LocalGateway:
         return codex_path
 
     def _codex_permission_args(self, sandbox_mode: CodexSessionSandboxMode) -> list[str]:
-        if sandbox_mode == "danger_full_access":
+        if sandbox_mode in {"danger_full_access", "full_access"}:
             return ["--dangerously-bypass-approvals-and-sandbox"]
         sandbox = "workspace-write" if sandbox_mode == "workspace_write" else "read-only"
         return ["--sandbox", sandbox]
 
     def _codex_resume_permission_args(self, sandbox_mode: CodexSessionSandboxMode) -> list[str]:
-        if sandbox_mode == "danger_full_access":
+        if sandbox_mode in {"danger_full_access", "full_access"}:
             return ["--dangerously-bypass-approvals-and-sandbox"]
         return []
 
     def _new_output_path(self) -> Path:
         with tempfile.NamedTemporaryFile(
-            prefix="codex-chatgpt-bridge-",
+            prefix="bridge-",
             suffix=".txt",
             delete=False,
         ) as handle:
@@ -1802,6 +1808,7 @@ class LocalGateway:
         self._session_store.upsert(record)
         return {
             "bridge_session_id": record.bridge_session_id,
+            "session_id": record.codex_session_id,
             "codex_session_id": record.codex_session_id,
             "cwd": record.cwd,
             "sandbox_mode": sandbox_mode,
@@ -2009,3 +2016,11 @@ class LocalGateway:
                         break
 
         return matches
+
+    # Clean Universal Bridge Aliases
+    bridge_delegate = codex_delegate
+    bridge_session_start = codex_session_start
+    bridge_session_continue = codex_session_continue
+    bridge_session_list = codex_session_list
+    bridge_session_status = codex_session_status
+    bridge_task_run = codex_task_run

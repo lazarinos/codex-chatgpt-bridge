@@ -17,7 +17,7 @@ async def test_read_file_requires_read_grant(tmp_path: Path) -> None:
     note = approved / "note.md"
     note.write_text("hello bridge", encoding="utf-8")
     gateway = LocalGateway(
-        BridgeConfig(grants=[BridgeGrant(path=approved, read=True, write=False, execute=False)])
+        BridgeConfig(trust_mode="restricted", grants=[BridgeGrant(path=approved, read=True, write=False, execute=False)])
     )
 
     result = await gateway.read_file(path=str(note))
@@ -27,7 +27,7 @@ async def test_read_file_requires_read_grant(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_read_file_denies_outside_grant(tmp_path: Path) -> None:
-    gateway = LocalGateway(BridgeConfig(grants=[BridgeGrant(path=tmp_path / "approved")]))
+    gateway = LocalGateway(BridgeConfig(trust_mode="restricted", grants=[BridgeGrant(path=tmp_path / "approved")]))
 
     with pytest.raises(BridgeError, match="not inside an approved grant"):
         await gateway.read_file(path=str(tmp_path / "outside.txt"))
@@ -38,14 +38,14 @@ async def test_write_file_requires_write_grant(tmp_path: Path) -> None:
     approved = tmp_path / "approved"
     approved.mkdir()
     read_only = LocalGateway(
-        BridgeConfig(grants=[BridgeGrant(path=approved, read=True, write=False, execute=False)])
+        BridgeConfig(trust_mode="restricted", grants=[BridgeGrant(path=approved, read=True, write=False, execute=False)])
     )
 
     with pytest.raises(BridgeError, match="write is not allowed"):
         await read_only.write_file(path=str(approved / "new.txt"), content="nope")
 
     writable = LocalGateway(
-        BridgeConfig(grants=[BridgeGrant(path=approved, read=True, write=True, execute=False)])
+        BridgeConfig(trust_mode="restricted", grants=[BridgeGrant(path=approved, read=True, write=True, execute=False)])
     )
     result = await writable.write_file(path=str(approved / "new.txt"), content="ok")
 
@@ -111,6 +111,7 @@ async def test_grant_path_defaults_to_read_only(tmp_path: Path) -> None:
 async def test_codex_task_run_requires_execute_grant(tmp_path: Path) -> None:
     gateway = LocalGateway(
         BridgeConfig(
+            trust_mode="restricted",
             enable_codex_tasks=True,
             grants=[BridgeGrant(path=tmp_path, read=True, write=True, execute=False)],
         )
@@ -123,7 +124,10 @@ async def test_codex_task_run_requires_execute_grant(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_codex_task_run_disabled_by_default(tmp_path: Path) -> None:
     gateway = LocalGateway(
-        BridgeConfig(grants=[BridgeGrant(path=tmp_path, read=True, write=True, execute=True)])
+        BridgeConfig(
+            enable_codex_tasks=False,
+            grants=[BridgeGrant(path=tmp_path, read=True, write=True, execute=True)],
+        )
     )
 
     with pytest.raises(BridgeError, match="disabled"):

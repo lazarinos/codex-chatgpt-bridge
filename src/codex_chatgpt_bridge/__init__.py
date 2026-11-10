@@ -1,4 +1,4 @@
-"""Codex ChatGPT Bridge package."""
+"""Bridge: Universal local MCP bridge for AI agents."""
 
 from __future__ import annotations
 

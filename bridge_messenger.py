@@ -45,7 +45,19 @@ if os.name == "nt":
         pass
 
 BRIDGE_URL: Final[str] = "http://127.0.0.1:8766"
-FALLBACK_INBOX: Final[Path] = Path.home() / ".codex-chatgpt-bridge" / "live_inbox.json"
+
+
+def _get_fallback_inbox() -> Path:
+    primary = Path.home() / ".bridge" / "live_inbox.json"
+    if primary.exists():
+        return primary
+    legacy = Path.home() / ".codex-chatgpt-bridge" / "live_inbox.json"
+    if legacy.exists():
+        return legacy
+    return primary
+
+
+FALLBACK_INBOX: Final[Path] = _get_fallback_inbox()
 
 ViewMode = Literal["all", "chat", "tools"]
 PriorityLevel = Literal["normal", "high", "urgent"]
@@ -485,7 +497,13 @@ class TuiRenderer:
         "list_dir": "List",
         "file_ops": "FileOps",
         "bridge_status": "Status",
-        "codex_delegate": "Task",
+        "bridge_delegate": "Delegate",
+        "bridge_task_run": "Task",
+        "bridge_session_start": "Session",
+        "bridge_session_continue": "Session",
+        "bridge_session_list": "Sessions",
+        "bridge_session_status": "Session",
+        "codex_delegate": "Delegate",
         "codex_task_run": "Task",
         "system_info": "SysInfo",
     }
@@ -551,7 +569,7 @@ class TuiRenderer:
     def render_welcome_banner(cls, width: int | None = None) -> str:
         w = width if width is not None else Theme.term_width()
         rows = [
-            (f"{Theme.ACCENT}{Theme.BOLD}Codex ChatGPT Bridge TUI{Theme.RESET} {Theme.MUTED}v0.4.0 (Multi-Thread Parallel Engine & Framed UX){Theme.RESET}", -1),
+            (f"{Theme.ACCENT}{Theme.BOLD}Bridge Live Messenger TUI{Theme.RESET} {Theme.MUTED}v0.5.0 (Agnostic Parallel Engine & Framed UX){Theme.RESET}", -1),
             (f"{Theme.SUCCESS}[ONLINE]{Theme.RESET} {Theme.TEXT}127.0.0.1:8766 · Parallel Worker Pool (32+ threads) · Bi-directional Live Queue{Theme.RESET}", -1),
             (f"{Theme.MUTED}Keys: <-/->, Home/End, Up/Dn history, Tab complete, Ctrl+P prio, F1 Help, F2 View, F3 Jobs, F4 Status{Theme.RESET}", -1),
             (f"{Theme.MUTED}Cmds: {Theme.WARN}/help{Theme.MUTED} · {Theme.WARN}/status{Theme.MUTED} · {Theme.WARN}/jobs{Theme.MUTED} · {Theme.WARN}/mode{Theme.MUTED} · {Theme.WARN}/filter{Theme.MUTED} · {Theme.WARN}/search{Theme.MUTED} · {Theme.WARN}/diff{Theme.MUTED} · {Theme.WARN}/export{Theme.MUTED} · {Theme.WARN}/clear{Theme.RESET}", -1),
@@ -1729,7 +1747,7 @@ class MessengerController:
                     out_path = Path(parts[1].strip()) if len(parts) > 1 else Path("bridge_session_export.md")
                     st = self.client.get_state(limit=200)
                     md_lines = [
-                        "# Codex ChatGPT Bridge — Session Export",
+                        "# Bridge — Session Export",
                         f"- **Exported at**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`",
                         "",
                         "## Messages",
@@ -1873,7 +1891,7 @@ def launch_gui() -> None:
     from tkinter import ttk
 
     root = tk.Tk()
-    root.title("Codex ChatGPT Bridge // Live Messenger")
+    root.title("Bridge // Live Agent Messenger")
     root.geometry("760x520")
     root.configure(bg="#0b0e14")
 
@@ -1882,7 +1900,7 @@ def launch_gui() -> None:
 
     title_lbl = tk.Label(
         hdr_frame,
-        text="CODEX BRIDGE // LIVE CHANNEL (NON-INTERRUPTING)",
+        text="BRIDGE // LIVE CHANNEL (NON-INTERRUPTING)",
         bg="#131822",
         fg="#f5b942",
         font=("Consolas", 11, "bold"),
@@ -2041,7 +2059,7 @@ def launch_gui() -> None:
 # 8. CLI Entrypoint
 # -----------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Codex Bridge Interactive TUI & Live Messenger.")
+    parser = argparse.ArgumentParser(description="Bridge Interactive TUI & Live Messenger.")
     parser.add_argument("message", nargs="*", help="Message text to send (omit to launch Interactive TUI).")
     parser.add_argument("--chat", "-c", action="store_true", help="Launch interactive terminal TUI.")
     parser.add_argument("--gui", "-g", action="store_true", help="Launch desktop Tkinter GUI.")

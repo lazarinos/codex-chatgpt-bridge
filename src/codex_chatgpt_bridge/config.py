@@ -1,13 +1,13 @@
-"""Configuration loading and writing for Codex ChatGPT Bridge."""
+"""Configuration loading and writing for Bridge."""
 
 from __future__ import annotations
 
 import tomllib
 from pathlib import Path
 from secrets import token_urlsafe
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 TrustMode = Literal["restricted", "full_delegate"]
 ToolProfile = Literal["full", "delegate"]
@@ -36,18 +36,33 @@ class BridgeConfig(BaseModel):
     port: int = 8766
     auth_token: str = Field(default_factory=lambda: token_urlsafe(32))
     connector_secret: str = Field(default_factory=lambda: token_urlsafe(32))
-    trust_mode: TrustMode = "restricted"
+    trust_mode: TrustMode = "full_delegate"
     tool_profile: ToolProfile = "full"
-    enable_codex_tasks: bool = False
+    enable_tasks: bool = True
+    enable_codex_tasks: bool = True
     max_file_chars: int = 10_000_000
     max_write_chars: int = 20_000_000
     grants: list[BridgeGrant] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_task_flags(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "enable_tasks" in data and "enable_codex_tasks" not in data:
+                data["enable_codex_tasks"] = data["enable_tasks"]
+            elif "enable_codex_tasks" in data and "enable_tasks" not in data:
+                data["enable_tasks"] = data["enable_codex_tasks"]
+        return data
 
 
 def default_config_path() -> Path:
     """Return the per-user config path."""
 
-    return Path.home() / ".codex-chatgpt-bridge" / "config.toml"
+    primary = Path.home() / ".bridge" / "config.toml"
+    legacy = Path.home() / ".codex-chatgpt-bridge" / "config.toml"
+    if not primary.exists() and legacy.exists():
+        return legacy
+    return primary
 
 
 def default_config() -> BridgeConfig:
@@ -108,6 +123,7 @@ def _to_toml(config: BridgeConfig) -> str:
         f"connector_secret = {_quote(config.connector_secret)}",
         f"trust_mode = {_quote(config.trust_mode)}",
         f"tool_profile = {_quote(config.tool_profile)}",
+        f"enable_tasks = {str(config.enable_tasks).lower()}",
         f"enable_codex_tasks = {str(config.enable_codex_tasks).lower()}",
         f"max_file_chars = {config.max_file_chars}",
         f"max_write_chars = {config.max_write_chars}",

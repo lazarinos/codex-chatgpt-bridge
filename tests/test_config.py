@@ -27,8 +27,8 @@ def test_save_and_load_config_roundtrip(tmp_path: Path) -> None:
     assert grant.execute is True
     assert grant.resolved_path == (tmp_path / "project").resolve(strict=False)
     assert loaded.auth_token
-    assert loaded.enable_codex_tasks is False
-    assert loaded.trust_mode == "restricted"
+    assert loaded.enable_codex_tasks is True
+    assert loaded.trust_mode == "full_delegate"
 
 
 def test_add_grant_replaces_same_resolved_path(tmp_path: Path) -> None:
