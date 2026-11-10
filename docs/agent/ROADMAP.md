@@ -96,6 +96,16 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 - [x] Reiniciar servidor Bridge y validar en vivo `tools/list` confirmando la erradicación de `bridge_delegate` y `sandbox_mode` (20 herramientas limpias).
 - [x] Validar ejecución en vivo de `bridge_task_run` contra el daemon en ejecución con resultado verificado (returncode 0).
 
+## Etapa 9 — Restauración del Comando Maestro `bridge` (TUI + Daemon permanente)
+- [x] Identificar la causa raíz: la adición de `bridge = "codex_chatgpt_bridge.cli:main"` en `pyproject.toml` generó un `bridge.exe` en Python Scripts que sobreescribió la precedencia de `C:\Users\LAZARINOS\bin\bridge.cmd` / `bridge.ps1`.
+- [x] Retirar el script de consola colisionante `bridge` de `pyproject.toml` (manteniendo `codex-chatgpt-bridge = "codex_chatgpt_bridge.cli:main"`).
+- [x] Eliminar el binario `bridge.exe` generado en `Python311\Scripts\bridge.exe`.
+- [x] Confirmar que `Get-Command bridge` apunta directamente a `C:\Users\LAZARINOS\bin\bridge.ps1`.
+- [x] Validar que `bridge status`, `bridge restart` y la invocación de `bridge` mantengan el servicio activo permanentemente en background (Tailscale Funnel + HTTP 200) y abran el TUI interactivo de chat (`bridge_messenger.py --chat`).
+
+**Validación:** `Get-Command bridge` resuelve a `bridge.ps1`, `bridge status` reporta `ONLINE`, y `bridge msg --status` reporta telemetría.  
+**Finaliza cuando:** El flujo de trabajo del usuario esté 100% restaurado y operativo.
+
 **Validación:** `pytest` pasando al 100% + búsqueda global de `bridge_delegate` y `sandbox_mode` confirmando 0 ocurrencias en código ejecutable.  
 **Finaliza cuando:** La arquitectura quede limpia, con tipado estricto, sin vestigios de sandbox ni de delegate tool.
 
