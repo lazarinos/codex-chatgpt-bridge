@@ -225,7 +225,14 @@ def _cmd_run(args: argparse.Namespace) -> None:
         config.port = args.port
     gateway = LocalGateway(config, config_path=args.config)
     app = create_app(gateway)
-    uvicorn.run(app, host=config.host, port=config.port, log_level=args.log_level)
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level=args.log_level,
+        timeout_keep_alive=75,
+        backlog=2048,
+    )
 
 
 def _cmd_doctor(args: argparse.Namespace) -> None:

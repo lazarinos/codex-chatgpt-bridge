@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 JsonObject = dict[str, Any]
+_STORE_LOCK = threading.RLock()
 
 _SILENT_ACTIVITY_SUFFIXES = (
     "agent_outbox.txt",
@@ -112,14 +116,31 @@ class LiveInboxStore:
         return data
 
     def _save(self, data: JsonObject) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        if len(data.get("messages", [])) > 150:
-            data["messages"] = data["messages"][-150:]
-        if len(data.get("action_log", [])) > 80:
-            data["action_log"] = data["action_log"][-80:]
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        with _STORE_LOCK:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            if len(data.get("messages", [])) > 150:
+                data["messages"] = data["messages"][-150:]
+            if len(data.get("action_log", [])) > 80:
+                data["action_log"] = data["action_log"][-80:]
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            for attempt in range(6):
+                tmp = self._path.with_suffix(f".{os.getpid()}.{uuid4().hex[:6]}.tmp")
+                try:
+                    tmp.write_text(payload, encoding="utf-8")
+                    tmp.replace(self._path)
+                    break
+                except PermissionError:
+                    with contextlib.suppress(Exception):
+                        tmp.unlink(missing_ok=True)
+                    if attempt == 5:
+                        with contextlib.suppress(Exception):
+                            self._path.write_text(payload, encoding="utf-8")
+                    else:
+                        time.sleep(0.008 * (attempt + 1))
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        tmp.unlink(missing_ok=True)
+                    raise
 
     def send_user_message(self, text: str, *, priority: str = "normal") -> JsonObject:
         """Enqueue a new live message from the user without interrupting the agent loop."""
@@ -166,10 +187,14 @@ class LiveInboxStore:
         }
         data["messages"].append(msg)
         self._save(data)
-        with contextlib.suppress(Exception):
-            import winsound
-            winsound.Beep(880, 140)
-            winsound.Beep(1175, 180)
+
+        def _beep_async() -> None:
+            with contextlib.suppress(Exception):
+                import winsound
+                winsound.Beep(880, 110)
+                winsound.Beep(1175, 140)
+
+        threading.Thread(target=_beep_async, daemon=True).start()
         return msg
 
     def pop_unread_for_agent(self, *, tool_name: str) -> list[JsonObject]:

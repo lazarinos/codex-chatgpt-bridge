@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
+import os
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -14,6 +18,65 @@ from .config import ToolProfile
 from .gateway import BridgeError, LocalGateway
 
 JsonObject = dict[str, Any]
+
+_MAX_PARALLEL_WORKERS: int = max(128, (os.cpu_count() or 8) * 16)
+_PARALLEL_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MAX_PARALLEL_WORKERS,
+    thread_name_prefix="bridge_worker",
+)
+_METRICS_LOCK = threading.Lock()
+_ACTIVE_WORKERS: int = 0
+_PEAK_WORKERS: int = 0
+_TOTAL_CALLS: int = 0
+_TURN_CALLS: int = 0
+
+
+def reset_turn_calls() -> None:
+    global _TURN_CALLS
+    with _METRICS_LOCK:
+        _TURN_CALLS = 0
+
+
+def get_parallel_telemetry(gateway: LocalGateway | None = None) -> JsonObject:
+    with _METRICS_LOCK:
+        active_w = _ACTIVE_WORKERS
+        peak_w = _PEAK_WORKERS
+        total_c = _TOTAL_CALLS
+        turn_c = _TURN_CALLS
+    running_jobs = 0
+    if gateway is not None:
+        try:
+            running_jobs = sum(
+                1 for j in gateway._job_manager.list_jobs() if j.get("status") == "running"
+            )
+        except Exception:
+            running_jobs = 0
+    return {
+        "active_workers": active_w,
+        "peak_workers": peak_w,
+        "max_workers": _MAX_PARALLEL_WORKERS,
+        "turn_calls": turn_c,
+        "total_calls": total_c,
+        "running_jobs": running_jobs,
+    }
+
+
+def _run_handler_in_worker_thread(
+    handler: Callable[..., Awaitable[JsonObject]],
+    arguments: JsonObject,
+) -> JsonObject:
+    return asyncio.run(handler(**arguments))
+
+
+_THREAD_OFFLOAD_TOOLS: set[str] = {
+    "search_files",
+    "list_dir",
+    "write_file",
+    "edit_file",
+    "file_ops",
+    "view_image",
+    "system_info",
+}
 
 
 class JsonRpcRequest(BaseModel):
@@ -42,16 +105,36 @@ def create_app(gateway: LocalGateway) -> FastAPI:
         return {
             "status": "ok",
             "server": "codex-chatgpt-bridge",
-            "version": "0.2.0",
+            "version": "0.4.0",
             "unread_user_messages": len(gateway._inbox_store.peek_unread_for_agent()),
+            "parallel_engine": get_parallel_telemetry(gateway),
         }
 
     @app.get("/inbox")
     async def inbox_get(limit: int = 50) -> JsonObject:
-        return gateway.inbox_state(limit=limit)
+        state = await asyncio.get_running_loop().run_in_executor(
+            _PARALLEL_POOL, lambda: gateway.inbox_state(limit=limit)
+        )
+        state["parallel_engine"] = get_parallel_telemetry(gateway)
+        try:
+            state["active_jobs"] = [
+                {
+                    "job_id": j["job_id"],
+                    "status": j["status"],
+                    "pid": j.get("pid"),
+                    "elapsed_s": j.get("elapsed_s"),
+                    "command": str(j.get("command", ""))[:80],
+                }
+                for j in gateway._job_manager.list_jobs()
+                if j.get("status") == "running"
+            ]
+        except Exception:
+            state["active_jobs"] = []
+        return state
 
     @app.post("/inbox/send")
     async def inbox_send(payload: LiveInboxMessageRequest) -> JsonObject:
+        reset_turn_calls()
         msg = gateway.inbox_send_user_message(payload.text, priority=payload.priority)
         return {"status": "queued", "message": msg, "inbox": gateway.inbox_state(limit=25)}
 
@@ -130,15 +213,34 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     arg_preview = (
         str(arguments.get("path") or arguments.get("command") or arguments.get("action") or "")[:160]
     )
-    gateway.inbox_record_activity(name, arg_preview)
-    structured = await handler(**arguments)
+    try:
+        gateway.inbox_record_activity(name, arg_preview)
+    except Exception:
+        pass
+
+    global _ACTIVE_WORKERS, _PEAK_WORKERS, _TOTAL_CALLS, _TURN_CALLS
+    with _METRICS_LOCK:
+        _ACTIVE_WORKERS += 1
+        _TOTAL_CALLS += 1
+        _TURN_CALLS += 1
+        if _ACTIVE_WORKERS > _PEAK_WORKERS:
+            _PEAK_WORKERS = _ACTIVE_WORKERS
+
+    try:
+        structured = await handler(**arguments)
+    finally:
+        with _METRICS_LOCK:
+            _ACTIVE_WORKERS = max(0, _ACTIVE_WORKERS - 1)
     mcp_image: JsonObject | None = None
     if isinstance(structured, dict):
         maybe_img = structured.pop("_mcp_image", None)
         if isinstance(maybe_img, dict) and "data" in maybe_img:
             mcp_image = maybe_img
         structured["bridge_chat_console"] = "online"
-        unread = gateway.inbox_pop_unread(tool_name=name)
+        try:
+            unread = gateway.inbox_pop_unread(tool_name=name)
+        except Exception:
+            unread = []
         if unread:
             structured["user_messages"] = unread
         jobs_info = gateway._job_manager.list_jobs()

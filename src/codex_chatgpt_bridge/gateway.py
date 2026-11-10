@@ -173,7 +173,7 @@ class LocalGateway:
             session_store_path or default_session_store_path(self._config_path)
         )
         self._inbox_store = LiveInboxStore(default_inbox_path(self._config_path))
-        self._job_manager = BackgroundJobManager(max_buffer_chars=400_000)
+        self._job_manager = BackgroundJobManager(max_buffer_chars=5_000_000)
 
     def _get_config_mtime_ns(self) -> int | None:
         if not self._has_explicit_config_path:
@@ -396,8 +396,9 @@ class LocalGateway:
 
         resolved = self._authorize(raw_path, read=True)
         limit = max_chars or self._config.max_file_chars
-        if limit <= 0 or limit > self._config.max_file_chars:
-            raise BridgeError(f"max_chars must be between 1 and {self._config.max_file_chars}")
+        if limit <= 0:
+            raise BridgeError("max_chars must be >= 1")
+        limit = max(limit, 1)
         if not resolved.exists():
             raise BridgeError(f"file does not exist: {resolved}")
         if resolved.is_dir():
@@ -646,13 +647,13 @@ class LocalGateway:
                         mime_type = "image/jpeg"
                         width, height = resized.size
             except Exception:
-                if os.name == "nt" and len(out_bytes) > 90_000:
+                if os.name == "nt":
                     with contextlib.suppress(Exception):
                         import subprocess
                         tmp_jpg = Path(tempfile.gettempdir()) / "codex_bridge_opt.jpg"
                         src_esc = str(resolved).replace("'", "''")
                         dst_esc = str(tmp_jpg).replace("'", "''")
-                        tw = max_width if max_width > 0 else 1280
+                        tw = min(max_width, 640) if max_width > 0 else 640
                         ps_opt = (
                             "Add-Type -AssemblyName System.Drawing; "
                             f"$img = [System.Drawing.Image]::FromFile('{src_esc}'); "
@@ -664,7 +665,7 @@ class LocalGateway:
                             "$g.DrawImage($img, 0, 0, $tw, $th); "
                             "$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }; "
                             "$ep = New-Object System.Drawing.Imaging.EncoderParameters(1); "
-                            "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]82); "
+                            "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]65); "
                             f"$bmp.Save('{dst_esc}', $enc, $ep); "
                             "Write-Output \"$tw,$th\"; "
                             "$g.Dispose(); $bmp.Dispose(); $img.Dispose()"
@@ -694,6 +695,7 @@ class LocalGateway:
                 "height": height,
                 "mode": mode_str,
                 "mean_rgb": mean_rgb,
+                "image_base64": b64_data,
             }
             text_summary = json.dumps(summary, ensure_ascii=False, indent=2)
             return {
@@ -1098,8 +1100,8 @@ class LocalGateway:
         self._maybe_reload_config()
         if not command or not command.strip():
             raise BridgeError("command must not be empty")
-        if timeout_s <= 0 or timeout_s > 600:
-            raise BridgeError("timeout_s must be between 0 and 600 seconds")
+        if timeout_s <= 0:
+            raise BridgeError("timeout_s must be > 0")
 
         target_cwd = cwd or (
             str(self._config.grants[0].resolved_path)
@@ -1389,8 +1391,8 @@ class LocalGateway:
         self._maybe_reload_config()
         if not query.strip():
             raise BridgeError("query must not be empty")
-        if max_results <= 0 or max_results > 200:
-            raise BridgeError("max_results must be between 1 and 200")
+        if max_results <= 0:
+            raise BridgeError("max_results must be >= 1")
 
         roots = [self._authorize(root, read=True)] if root else self._readable_roots()
         has_rg = shutil.which("rg") is not None

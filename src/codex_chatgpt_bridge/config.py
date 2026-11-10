@@ -39,8 +39,8 @@ class BridgeConfig(BaseModel):
     trust_mode: TrustMode = "restricted"
     tool_profile: ToolProfile = "full"
     enable_codex_tasks: bool = False
-    max_file_chars: int = 200_000
-    max_write_chars: int = 400_000
+    max_file_chars: int = 10_000_000
+    max_write_chars: int = 20_000_000
     grants: list[BridgeGrant] = Field(default_factory=list)
 
 

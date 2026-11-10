@@ -551,10 +551,10 @@ class TuiRenderer:
     def render_welcome_banner(cls, width: int | None = None) -> str:
         w = width if width is not None else Theme.term_width()
         rows = [
-            (f"{Theme.ACCENT}{Theme.BOLD}Codex ChatGPT Bridge TUI{Theme.RESET} {Theme.MUTED}v0.3.0 (Resize-Safe & Framed Input){Theme.RESET}", -1),
-            (f"{Theme.SUCCESS}[ONLINE]{Theme.RESET} {Theme.TEXT}127.0.0.1:8766 · Bi-directional live channel{Theme.RESET}", -1),
-            (f"{Theme.MUTED}Keys: <-/->, Home/End, Up/Dn history, Tab complete, Ctrl+P prio, F2 view{Theme.RESET}", -1),
-            (f"{Theme.MUTED}Cmds: {Theme.WARN}/help{Theme.MUTED} · {Theme.WARN}/status{Theme.MUTED} · {Theme.WARN}/mode{Theme.MUTED} · {Theme.WARN}/filter{Theme.MUTED} · {Theme.WARN}/search{Theme.MUTED} · {Theme.WARN}/diff{Theme.MUTED} · {Theme.WARN}/export{Theme.MUTED} · {Theme.WARN}/clear{Theme.RESET}", -1),
+            (f"{Theme.ACCENT}{Theme.BOLD}Codex ChatGPT Bridge TUI{Theme.RESET} {Theme.MUTED}v0.4.0 (Multi-Thread Parallel Engine & Framed UX){Theme.RESET}", -1),
+            (f"{Theme.SUCCESS}[ONLINE]{Theme.RESET} {Theme.TEXT}127.0.0.1:8766 · Parallel Worker Pool (32+ threads) · Bi-directional Live Queue{Theme.RESET}", -1),
+            (f"{Theme.MUTED}Keys: <-/->, Home/End, Up/Dn history, Tab complete, Ctrl+P prio, F1 Help, F2 View, F3 Jobs, F4 Status{Theme.RESET}", -1),
+            (f"{Theme.MUTED}Cmds: {Theme.WARN}/help{Theme.MUTED} · {Theme.WARN}/status{Theme.MUTED} · {Theme.WARN}/jobs{Theme.MUTED} · {Theme.WARN}/mode{Theme.MUTED} · {Theme.WARN}/filter{Theme.MUTED} · {Theme.WARN}/search{Theme.MUTED} · {Theme.WARN}/diff{Theme.MUTED} · {Theme.WARN}/export{Theme.MUTED} · {Theme.WARN}/clear{Theme.RESET}", -1),
         ]
         return cls.render_box(rows, border_color=Theme.ACCENT, title="Bridge Console", width=w)
 
@@ -845,11 +845,16 @@ class TuiLineEditor:
             short_s = AnsiTextMetrics.truncate_plain(agent_sum, max(8, inner // 3))
             agent_part = f"{agent_tool}({short_s})"
         filt_part = f" · Filter:{filt}" if filt else ""
+        active_w = int(meta.get("active_workers", 0) or 0)
+        max_w = int(meta.get("max_workers", 32) or 32)
+        run_jobs = int(meta.get("running_jobs", 0) or 0)
+        turn_c = int(meta.get("turn_calls", 0) or 0)
+        total_c = int(meta.get("total_calls", 0) or 0)
         char_cnt = len(self.input_chars)
 
         raw_header = (
-            f" Input [{prio}] · View:{view}{filt_part} · Q:{unread} · "
-            f"[{spin}] {agent_part} · {char_cnt}c "
+            f" Input [{prio}] · Calls:{turn_c}/{total_c} · W:{active_w}/{max_w} · J:{run_jobs} · "
+            f"Q:{unread} · View:{view}{filt_part} · [{spin}] {agent_part} · {char_cnt}c "
         )
         clean_header = AnsiTextMetrics.truncate_plain(raw_header, max(10, w - 4))
         h_vis = AnsiTextMetrics.visible_width(clean_header)
@@ -932,7 +937,7 @@ class TuiLineEditor:
                 f"{border_color}{Theme.VLINE}{Theme.RESET}"
             )
 
-        raw_footer = " [Enter] Send · [Tab] Complete · [Up/Dn] History · [Ctrl+P] Prio · [F2] View · [/help] "
+        raw_footer = " [Enter] Send · [Tab] Complete · [Up/Dn] History · [Ctrl+P] Prio · [F2] View · [F3] Jobs · [F4] Status "
         clean_footer = AnsiTextMetrics.truncate_plain(raw_footer, max(10, w - 4))
         f_vis = AnsiTextMetrics.visible_width(clean_footer)
         bot_dashes = max(0, w - 3 - f_vis)
@@ -1132,6 +1137,12 @@ class TuiLineEditor:
                         elif ext == "<":  # F2 -> cycle view mode
                             if self.on_hotkey:
                                 self.on_hotkey("F2")
+                        elif ext == "=":  # F3 -> /jobs & parallel workers
+                            if self.on_hotkey:
+                                self.on_hotkey("F3")
+                        elif ext == ">":  # F4 -> /status telemetry
+                            if self.on_hotkey:
+                                self.on_hotkey("F4")
                     continue
 
                 if ch == "\x03":  # Ctrl+C
@@ -1243,6 +1254,11 @@ class MessengerController:
         self.unread_count: int = 0
         self.active_agent_tool: str = "idle"
         self.active_agent_summary: str = ""
+        self.active_workers: int = 0
+        self.max_workers: int = 32
+        self.running_jobs_count: int = 0
+        self.turn_calls: int = 0
+        self.total_calls: int = 0
 
         self.feed_events: list[FeedEvent] = []
         self.deferred_tool_blocks: list[str] = []
@@ -1276,6 +1292,11 @@ class MessengerController:
             "unread_count": self.unread_count,
             "agent_tool": self.active_agent_tool,
             "agent_summary": self.active_agent_summary,
+            "active_workers": self.active_workers,
+            "max_workers": self.max_workers,
+            "running_jobs": self.running_jobs_count,
+            "turn_calls": self.turn_calls,
+            "total_calls": self.total_calls,
         }
 
     def _handle_hotkey(self, key: str) -> None:
@@ -1290,6 +1311,10 @@ class MessengerController:
             self.reflow_screen()
         elif key == "F1":
             self._emit_system_box(self._build_help_box())
+        elif key == "F3":
+            self._emit_system_box(self._build_jobs_box())
+        elif key == "F4":
+            self._emit_system_box(self._build_status_box())
 
     def handle_terminal_resize(self, cols: int, rows: int) -> None:
         """Triggered automatically when the terminal window is resized."""
@@ -1408,14 +1433,25 @@ class MessengerController:
                 # Check idle flush for consolidated reading actions
                 self.consolidator.check_idle_flush(idle_seconds=1.2)
 
-                # Live Agent telemetry updated in the framed input box header
+                # Live Agent & Parallel Worker Pool telemetry updated in the framed input box header
                 tele = state.get("agent_telemetry") or {}
+                p_eng = state.get("parallel_engine") or {}
+                self.active_workers = int(p_eng.get("active_workers", 0) or 0)
+                self.max_workers = int(p_eng.get("max_workers", 32) or 32)
+                self.running_jobs_count = int(p_eng.get("running_jobs", len(state.get("active_jobs") or [])) or 0)
                 cur_tool = tele.get("last_tool") or "idle"
                 cur_sum = tele.get("last_summary") or ""
                 cur_upd = tele.get("updated_at") or ""
+                new_sig = f"{cur_tool}|{cur_upd}"
+                if new_sig != self.last_tool_sig and cur_upd:
+                    self.turn_calls += 1
+                    self.total_calls += 1
+                if p_eng.get("total_calls") is not None:
+                    self.turn_calls = int(p_eng.get("turn_calls", self.turn_calls) or 0)
+                    self.total_calls = max(self.total_calls, int(p_eng.get("total_calls", 0) or 0))
                 self.active_agent_tool = TuiRenderer.TOOL_LABELS.get(cur_tool, cur_tool)
                 self.active_agent_summary = Path(cur_sum).name if ("\\" in cur_sum or "/" in cur_sum) else cur_sum[:28]
-                self.last_tool_sig = f"{cur_tool}|{cur_upd}"
+                self.last_tool_sig = new_sig
 
                 # Process messages
                 for m in state.get("messages") or []:
@@ -1432,12 +1468,14 @@ class MessengerController:
                         self.consolidator.flush()
 
                         if sender == "agent":
-                            try:
-                                import winsound
-                                winsound.Beep(880, 140)
-                                winsound.Beep(1175, 180)
-                            except Exception:
-                                pass
+                            def _beep_agent() -> None:
+                                try:
+                                    import winsound
+                                    winsound.Beep(880, 110)
+                                    winsound.Beep(1175, 140)
+                                except Exception:
+                                    pass
+                            threading.Thread(target=_beep_agent, daemon=True).start()
                             self.record_and_print_event(FeedEvent(kind="agent", timestamp=ts, text=txt))
                         else:
                             if m.get("read_by_agent"):
@@ -1467,6 +1505,38 @@ class MessengerController:
             except Exception:
                 pass
             self.stop_event.wait(0.60)
+
+    def _build_jobs_box(self) -> str:
+        st = self.client.get_state()
+        p_eng = st.get("parallel_engine") or {}
+        act_jobs = st.get("active_jobs") or []
+        rows = [
+            (f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.TEXT}Turn: {self.turn_calls} · Session Total: {self.total_calls}{Theme.RESET}", -1),
+            (f"{Theme.TOOL}Worker Pool:{Theme.RESET} {Theme.TEXT}{self.active_workers}/{self.max_workers} active threads{Theme.RESET}", -1),
+            (f"{Theme.TOOL}Active Jobs:{Theme.RESET} {Theme.TEXT}{len(act_jobs)} running{Theme.RESET}", -1),
+        ]
+        for j in act_jobs[:8]:
+            rows.append((f"  {Theme.WARN}* [{j.get('job_id')}] PID {j.get('pid')} ({j.get('elapsed_s')}s): {j.get('command')}{Theme.RESET}", -1))
+        return TuiRenderer.render_box(rows, border_color=Theme.TOOL, title="Parallel Engine & Call Telemetry (F3)")
+
+    def _build_status_box(self) -> str:
+        st = self.client.get_state()
+        t = st.get("agent_telemetry") or {}
+        unread_cnt = st.get("unread_user_messages", 0)
+        tot_msgs = st.get("total_messages", 0)
+        tot_acts = len(st.get("action_log") or [])
+        last_t = t.get("last_tool", "idle")
+        last_s = AnsiTextMetrics.truncate_plain(t.get("last_summary", "") or "", 48)
+        upd_t = (t.get("updated_at") or "")[11:19] or "recent"
+        cols, rows = Theme.term_size()
+        status_rows = [
+            (f"{Theme.SUCCESS}[STATUS]{Theme.RESET} {Theme.TEXT}HTTP Gateway active (127.0.0.1:8766){Theme.RESET}", -1),
+            (f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.SUCCESS}Turn: {self.turn_calls}{Theme.RESET} · {Theme.TEXT}Total: {self.total_calls} · Actions logged: {tot_acts}{Theme.RESET}", -1),
+            (f"{Theme.TOOL}Viewport:{Theme.RESET} {Theme.TEXT}{cols}x{rows} cols/rows · Mode: {self.view_mode.upper()} · Prio: {self.default_priority.upper()}{Theme.RESET}", -1),
+            (f"{Theme.TOOL}Unread queue:{Theme.RESET} {Theme.WARN}{unread_cnt} pending{Theme.RESET} · {Theme.TEXT}{tot_msgs} msgs{Theme.RESET}", -1),
+            (f"{Theme.ACCENT}Last tool:{Theme.RESET} {Theme.TEXT}{last_t}{Theme.RESET} {Theme.MUTED}({last_s}) · {upd_t}{Theme.RESET}", -1),
+        ]
+        return TuiRenderer.render_box(status_rows, border_color=Theme.TOOL, title="Bridge Status (F4)")
 
     def _build_help_box(self) -> str:
         help_rows = [
@@ -1767,6 +1837,7 @@ class MessengerController:
                 if not txt:
                     continue
 
+                self.turn_calls = 0
                 res = self.client.send_user_message(txt, priority=prio)
                 msg = res.get("message") or {}
                 mid = msg.get("id", "")
