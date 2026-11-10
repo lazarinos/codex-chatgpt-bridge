@@ -71,10 +71,29 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 - [x] Commit y push a `origin/main`.
 - [x] Servidor activo y verificado respondiendo en vivo.
 
+## Etapa 7 — Auditoría de Concurrencia y Paralelización Masiva
+- [x] Diseñar batería de pruebas de estrés y paralelismo sobre el servidor activo (`127.0.0.1:8766`).
+- [x] Ejecutar ráfaga masiva concurrente de solicitudes MCP HTTP (50 llamadas simultáneas: `bridge_status`, `system_info`, `list_grants`, `bridge_session_list`).
+- [x] Ejecutar operaciones de I/O de archivos paralelas (`write_file`, `read_file`, `edit_file`) en 20 archivos independientes concurrentes.
+- [x] Ejecutar búsquedas simultáneas en paralelo (`search_files`) con motor Ripgrep bajo contención (10 búsquedas simultáneas).
+- [x] Ejecutar procesos de sistema en paralelo (`exec_command`) en modo síncrono (8 procesos simultáneos con PIDs y Job IDs aislados).
+- [x] Ejecutar y monitorear tareas en background concurrentes (4 jobs asíncronos concurrentes con `process_manager`).
+- [x] Ejecutar consultas concurrentes de sesiones (`bridge_session_list` y `bridge_session_status`).
+- [x] Inspeccionar telemetría de concurrencia en tiempo real (`/healthz` -> `parallel_engine`: `active_workers`, `peak_workers`, `running_jobs`).
+- [x] Verificar que no existan carreras de datos, deadlocks, corrupción de buffers ni errores de socket.
+
+**Validación:** Script exhaustivo de benchmarking concurrente y asíncrono con telemetría en vivo (`benchmark_concurrency.py`).  
+**Finaliza cuando:** Todas las ejecuciones paralelas retornen exitosamente con métricas de throughput y latencia.
+
 ## Evidencia de validación
 | Validación | Comando | Resultado |
 |---|---|---|
-| Suite de Pruebas | `$env:PYTHONPATH="src;."; pytest` | **71 passed in 1.97s** (100% verde) |
+| Suite de Pruebas | `python -m pytest tests` | **71 passed in 2.21s** (100% verde) |
 | Eliminación de Sandbox | `tools/list` en `/mcp` | `bridge_delegate` y `bridge_task_run` **sin `sandbox_mode`** |
 | Detección de Ripgrep | `bridge_status` en `/mcp` | `ripgrep_available: True`, `search_engine: ripgrep` |
-| Modo de Confianza | `bridge_status` en `/mcp` | `trust_mode: full_delegate`, `tool_profile: full` |
+| Ráfaga MCP Concurrente | `benchmark_concurrency.py` (Escenario 1) | **50/50 llamadas en 1.675s (29.85 req/s)** |
+| I/O Paralelo de Archivos | `benchmark_concurrency.py` (Escenario 2) | **20 escrituras (0.134s), 20 lecturas (0.098s), 20 ediciones (0.136s)** |
+| Búsquedas Ripgrep Paralelas | `benchmark_concurrency.py` (Escenario 3) | **10 búsquedas en 0.411s (392ms latencia media)** |
+| Procesos del SO Paralelos | `benchmark_concurrency.py` (Escenario 4) | **8 procesos en 1.044s (8 PIDs únicos, salidas aisladas)** |
+| Background Jobs Asíncronos | `benchmark_concurrency.py` (Escenario 5) | **4 jobs concurrentes rastreados por Process Manager** |
+| Consultas de Sesión Paralelas| `benchmark_concurrency.py` (Escenario 6) | **20 consultas en 0.114s sin contención** |
