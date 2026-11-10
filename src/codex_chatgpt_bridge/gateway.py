@@ -1218,7 +1218,18 @@ class LocalGateway:
     async def _schedule_self_restart(self) -> JsonObject:
         """Spawn a detached watchdog to restart the bridge process after returning HTTP 200."""
 
+        import compileall
         import subprocess
+
+        # Pre-flight guard: ensure source code compiles without syntax errors before killing current server
+        repo_src = Path.home() / "codex-chatgpt-bridge-clean" / "src"
+        if repo_src.exists():
+            syntax_ok = await asyncio.to_thread(compileall.compile_dir, str(repo_src), quiet=1)
+            if not syntax_ok:
+                raise BridgeError(
+                    "Self-restart aborted: Python syntax errors detected in bridge codebase. "
+                    "Fix code syntax errors before restarting to prevent server outage."
+                )
 
         current_pid = os.getpid()
         bridge_ps1 = Path.home() / "bin" / "bridge.ps1"
@@ -1253,6 +1264,7 @@ class LocalGateway:
         flags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         )
         subprocess.Popen(
             cmd,
