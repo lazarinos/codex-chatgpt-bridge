@@ -91,11 +91,14 @@ def create_app(gateway: LocalGateway) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> JsonObject:
+        unread_cnt = await asyncio.get_running_loop().run_in_executor(
+            _PARALLEL_POOL, gateway._inbox_store.peek_unread_count_cached
+        )
         return {
             "status": "ok",
             "server": "bridge",
             "version": "0.5.0",
-            "unread_user_messages": len(gateway._inbox_store.peek_unread_for_agent()),
+            "unread_user_messages": unread_cnt,
             "parallel_engine": get_parallel_telemetry(gateway),
         }
 
@@ -209,7 +212,9 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
             or ""
         )[:160]
         with contextlib.suppress(Exception):
-            gateway.inbox_record_activity(name, arg_preview)
+            await asyncio.get_running_loop().run_in_executor(
+                _PARALLEL_POOL, gateway.inbox_record_activity, name, arg_preview
+            )
 
     global _ACTIVE_WORKERS, _PEAK_WORKERS, _TOTAL_CALLS, _TURN_CALLS
     with _METRICS_LOCK:
@@ -231,7 +236,9 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
             mcp_image = maybe_img
         structured["bridge_chat_console"] = "online"
         try:
-            unread = gateway.inbox_pop_unread(tool_name=name)
+            unread = await asyncio.get_running_loop().run_in_executor(
+                _PARALLEL_POOL, lambda: gateway.inbox_pop_unread(tool_name=name)
+            )
         except Exception:
             unread = []
         if unread:

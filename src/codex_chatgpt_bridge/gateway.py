@@ -803,7 +803,12 @@ class LocalGateway:
                 w_preview.append(f"+ {idx:>4d} │ {nl[:104]}")
             if len(new_lines) > 8:
                 w_preview.append(f"+ ... ({len(new_lines) - 8} more lines)")
-            self._inbox_store.record_agent_activity("write_file", str(resolved), "\n".join(w_preview))
+            await asyncio.to_thread(
+                self._inbox_store.record_agent_activity,
+                "write_file",
+                str(resolved),
+                "\n".join(w_preview),
+            )
         return {"path": str(resolved), "bytes": len(content.encode("utf-8"))}
 
     async def _apply_inline_edit_block(self, path: str, content: str) -> JsonObject:
@@ -916,7 +921,12 @@ class LocalGateway:
                 diff_preview.append(f"+ {base_line + idx:>4d} │ {nl[:104]}")
             if len(new_lines) > 10:
                 diff_preview.append(f"+ ... ({len(new_lines) - 10} more added lines)")
-            self._inbox_store.record_agent_activity("edit_file", str(resolved), "\n".join(diff_preview))
+            await asyncio.to_thread(
+                self._inbox_store.record_agent_activity,
+                "edit_file",
+                str(resolved),
+                "\n".join(diff_preview),
+            )
         return {
             "path": str(resolved),
             "mode": mode,
@@ -1216,8 +1226,17 @@ class LocalGateway:
             return {"jobs": self._job_manager.list_jobs()}
 
         if action == "job_status":
-            target_id = job_id or "latest"
+            target_id = (job_id or "latest").strip()
             try:
+                if target_id.startswith("wait:"):
+                    real_id = target_id.split(":", 1)[1].strip() or "latest"
+                    return {
+                        "job": await self._job_manager.wait_for_job(
+                            real_id,
+                            timeout_s=15.0,
+                            tail_chars=tail_chars,
+                        )
+                    }
                 job = self._job_manager.get_job(target_id)
             except KeyError as exc:
                 raise BridgeError(str(exc)) from exc
@@ -1882,6 +1901,13 @@ class LocalGateway:
         self._config_mtime_ns = self._get_config_mtime_ns()
 
     async def _run_rg(self, *, query: str, root: Path, remaining: int) -> list[JsonObject]:
+        if query.startswith(("files:", "glob:")):
+            return await asyncio.to_thread(
+                self._python_search_files,
+                query=query,
+                root=root,
+                remaining=remaining,
+            )
         rg_bin = find_rg_path() or "rg"
         command = [
             rg_bin,
@@ -1890,12 +1916,32 @@ class LocalGateway:
             "--column",
             "--color",
             "never",
+            "--max-filesize",
+            "2M",
+            "--max-columns",
+            "1000",
+            "--max-count",
+            str(max(20, min(remaining, 100))),
             "--glob",
             "!.git/**",
             "--glob",
             "!.venv/**",
             "--glob",
+            "!venv/**",
+            "--glob",
             "!node_modules/**",
+            "--glob",
+            "!compass-out/**",
+            "--glob",
+            "!build/**",
+            "--glob",
+            "!build-vs/**",
+            "--glob",
+            "!dist/**",
+            "--glob",
+            "!target/**",
+            "--glob",
+            "!__pycache__/**",
             query,
             str(root),
         ]

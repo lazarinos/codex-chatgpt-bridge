@@ -246,8 +246,23 @@ def _ensure_stdio() -> None:
             pass
 
 
+def _boost_bridge_server_priority() -> None:
+    """Set ABOVE_NORMAL_PRIORITY_CLASS on Windows so heavy builds never starve the HTTP gateway."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        above_normal = 0x00008000
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), above_normal)
+    except Exception:
+        pass
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
     _ensure_stdio()
+    _boost_bridge_server_priority()
     _apply_windows_socket_inheritance_protection()
     config = load_config(args.config)
     if args.host:
@@ -261,6 +276,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         host=config.host,
         port=config.port,
         log_level=args.log_level,
+        access_log=False,
         timeout_keep_alive=75,
         backlog=2048,
     )

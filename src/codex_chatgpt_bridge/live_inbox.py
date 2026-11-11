@@ -108,10 +108,32 @@ class LiveInboxStore:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or default_inbox_path()
+        self._cached_mtime_ns: int | None = None
+        self._cached_unread_count: int = 0
 
     @property
     def path(self) -> Path:
         return self._path
+
+    def _update_unread_cache(self, data: JsonObject) -> None:
+        self._cached_unread_count = sum(
+            1
+            for m in data.get("messages", [])
+            if m.get("sender") == "user" and not m.get("read_by_agent", False)
+        )
+        with contextlib.suppress(OSError):
+            if self._path.exists():
+                self._cached_mtime_ns = self._path.stat().st_mtime_ns
+
+    def peek_unread_count_cached(self) -> int:
+        """Fast O(1) unread check for /healthz that avoids disk I/O when file mtime is unchanged."""
+        outbox = self._path.parent / "agent_outbox.txt"
+        with contextlib.suppress(OSError):
+            if not outbox.exists() and self._path.exists():
+                mtime_ns = self._path.stat().st_mtime_ns
+                if self._cached_mtime_ns is not None and mtime_ns == self._cached_mtime_ns:
+                    return self._cached_unread_count
+        return len(self.peek_unread_for_agent())
 
     def _load(self) -> JsonObject:
         with _STORE_LOCK:
@@ -178,6 +200,8 @@ class LiveInboxStore:
                         dedup_changed = True
             if dedup_changed:
                 self._save(data)
+            else:
+                self._update_unread_cache(data)
             return data
 
     def _save(self, data: JsonObject) -> None:
@@ -193,6 +217,7 @@ class LiveInboxStore:
                 try:
                     _write_text_with_retry(tmp, payload)
                     tmp.replace(self._path)
+                    self._update_unread_cache(data)
                     return
                 except PermissionError:
                     _unlink_with_retry(tmp)
@@ -204,6 +229,7 @@ class LiveInboxStore:
                     _unlink_with_retry(tmp)
                     raise
             _write_text_with_retry(self._path, payload)
+            self._update_unread_cache(data)
 
     def send_user_message(self, text: str, *, priority: str = "normal") -> JsonObject:
         """Enqueue a new live message from the user without interrupting the agent loop."""

@@ -26,6 +26,21 @@ ShellKind = Literal["powershell", "cmd", "python", "sh", "auto"]
 _WINDOWS_CREATE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
 )
+_WINDOWS_NORMAL_PRIORITY = 0x00000020
+_WINDOWS_BELOW_NORMAL_PRIORITY = 0x00004000
+_HEAVY_BUILD_CMD_RE = re.compile(
+    r"\b(?:cmake|msbuild|ninja|cargo|cl\.exe|link\.exe|gradle|mvn|pytest|ctest)\b",
+    re.IGNORECASE,
+)
+
+
+def _select_windows_creation_flags(command: str = "", *, background: bool = False) -> int:
+    """Ensure child processes never inherit ABOVE_NORMAL priority and heavy builds run BELOW_NORMAL."""
+    if os.name != "nt":
+        return 0
+    if background or _HEAVY_BUILD_CMD_RE.search(command or ""):
+        return _WINDOWS_CREATE_FLAGS | _WINDOWS_BELOW_NORMAL_PRIORITY
+    return _WINDOWS_CREATE_FLAGS | _WINDOWS_NORMAL_PRIORITY
 
 
 def default_non_interactive_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -42,6 +57,8 @@ def default_non_interactive_env(extra_env: dict[str, str] | None = None) -> dict
             "NPM_CONFIG_YES": "true",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
+            "MSBUILDDISABLENODEREUSE": "1",
+            "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER": "1",
         }
     )
     if extra_env:
@@ -387,7 +404,10 @@ class BackgroundJobManager:
             "close_fds": True,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = _WINDOWS_CREATE_FLAGS
+            kwargs["creationflags"] = _select_windows_creation_flags(
+                command,
+                background=allow_stdin,
+            )
         else:
             kwargs["start_new_session"] = True
 
@@ -445,7 +465,7 @@ class BackgroundJobManager:
             return result
 
         effective_wait = (
-            min(float(timeout_s), 12.0) if auto_background_on_timeout else float(timeout_s)
+            min(float(timeout_s), 15.0) if auto_background_on_timeout else min(float(timeout_s), 20.0)
         )
         try:
             await asyncio.wait_for(job.process.wait(), timeout=effective_wait)
