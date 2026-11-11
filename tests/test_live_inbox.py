@@ -155,3 +155,23 @@ def test_concurrent_readers_and_writers_preserve_messages_without_errors(
     remaining_unread = [m["text"] for m in store.pop_unread_for_agent(tool_name="final")]
     total_delivered = len(popped_texts) + len(remaining_unread)
     assert total_delivered == 6 * 12
+
+
+def test_send_agent_reply_suppresses_beep_under_pytest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_threads: list[Any] = []
+    monkeypatch.setattr(
+        threading,
+        "Thread",
+        lambda *args, **kwargs: started_threads.append((args, kwargs)),
+    )
+    store = LiveInboxStore(tmp_path / "live_inbox.json")
+    msg = store.send_agent_reply("sin pitidos en tests")
+    assert msg["text"] == "sin pitidos en tests"
+    assert started_threads == []
+    assert live_inbox._should_play_beep() is False
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("BRIDGE_DISABLE_BEEP", "0")
+    assert live_inbox._should_play_beep() is True

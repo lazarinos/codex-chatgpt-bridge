@@ -9,23 +9,26 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 5. **Detección e instalación de Ripgrep:** Instalación de `BurntSushi.ripgrep.MSVC 15.2.0` y soporte para auto-detección dinámica vía `find_rg_path()` en Windows (winget/PATH).
 
 ## Estado general
-- Estado: Completado
-- Última actualización: 2026-11-10 20:19
+- Estado: Completado (Etapa 11 — Canales Limpios y Ordenados, Sin Codex Luna Intermedio, Mensajería Directa `bridge_inbox`, Escaping Seguro Windows y Silencio de Pitidos en Tests)
+- Última actualización: 2026-11-10 20:57
 - Riesgo actual: Bajo
 - Responsable: Agente autónomo
 
 ## Alcance
-- Incluye: Endurecimiento MCP (`additionalProperties: False`, anotaciones explícitas, auth constant-time, JSON-RPC `-32602` en args inválidos), concurrencia en `LiveInboxStore` (`_STORE_LOCK` + reintentos 15-20ms), limpieza periódica en segundo plano en `BackgroundJobManager` (`clear_finished()`), backoff exponencial `(1s, 2s, 4s)` en `bridge_messenger.py` `poll_worker`, corrección de fallback `view_image` sin Pillow, aislamiento de `HOME`/`USERPROFILE` en tests (`tests/conftest.py`), y configuración por defecto de `set-tool-profile delegate` en el comando global `bridge` (`bridge.ps1` + `restart-bridge.ps1`).
+- Incluye: Endurecimiento MCP (`additionalProperties: False`, anotaciones explícitas, auth constant-time, JSON-RPC `-32602` en args inválidos), canal directo `bridge_inbox` (~7–25ms sin subprocesos), ordenación SSOT `ordered_visible_tool_names()`, canal puro por defecto (`pure`: `tool_profile="full"`, `enable_tasks=False`, `trust_mode="full_delegate"`, sin Codex Luna intermedio), comando CLI `bridge channel [pure|delegate|codex]` / `set-channel`, eliminación de parche roto `patch_gateway.py` y extracción de `_publish_codex_result_to_tui()`, UTF-16LE `-EncodedCommand` + `stdin_text` + unwrap de shims `.cmd` npm, concurrencia en `LiveInboxStore` (`_STORE_LOCK`, reintentos 15–20ms y supresión de `winsound.Beep` bajo `pytest`/`BRIDGE_DISABLE_BEEP`), limpieza periódica en `BackgroundJobManager`, backoff `(1s, 2s, 4s)` en `bridge_messenger.py`, corrección de `view_image` sin Pillow, y aislamiento completo en `tests/conftest.py`.
 - No incluye: Cambios destructivos de API ni reincorporación de herramientas eliminadas (`bridge_delegate`, `sandbox_mode`).
 
 ## Criterios de aceptación
-- [x] Configuración base de librería (`BridgeConfig`) y CLI `bridge` operan sin bloqueos (`trust_mode = "full_delegate"`, `enable_tasks = True`, y comando global `bridge` aplica `tool_profile = "delegate"` por defecto).
-- [x] Desactivación total de hints destructivos (`destructiveHint: False`, `openWorldHint: False`, `readOnlyHint: True`) y esquemas cerrados (`additionalProperties: False`) en todas las herramientas MCP.
+- [x] Configuración base de librería (`BridgeConfig`) mantiene compatibilidad de contratos y CLI `bridge channel pure` / `bridge.ps1` dejan el canal activo en modo puro directo (`tool_profile = "full"`, `enable_tasks = false`, `trust_mode = "full_delegate"`, 0 LLM Codex intermedio).
+- [x] Desactivación total de hints destructivos (`destructiveHint: False`, `openWorldHint: False`, `readOnlyHint: True`) y esquemas cerrados (`additionalProperties: False`) en todas las herramientas MCP (SSOT).
+- [x] Canal instantáneo `bridge_inbox` (`reply`, `state`, `pop`, `clear`) operativo y herramientas ordenadas lógicamente vía `ordered_visible_tool_names()` sin subprocesos ni spam en `action_log`.
+- [x] Auto-notificación TUI segura (`_publish_codex_result_to_tui()` sin `ValueError` en salidas vacías) y supresión de pitidos `winsound.Beep` durante `pytest` (`_should_play_beep()` + `tests/conftest.py`).
+- [x] Escaping seguro en Windows: PowerShell vía UTF-16LE `-EncodedCommand`, shims `.cmd` npm desempaquetados a `node.exe` directo y prompts complejos/multilínea enviados por `stdin` (`-`).
 - [x] `sandbox_mode` y `bridge_delegate` 100% eliminados de todos los esquemas MCP y gateway.
 - [x] Ripgrep instalado (`rg 15.2.0`) y activo en el motor de búsqueda (`ripgrep_available: True`).
 - [x] Servidor MCP titulado e identificado como `bridge` v0.5.0.
-- [x] Concurrencia en `LiveInboxStore` protegida con `_STORE_LOCK` en `_load()` y reintentos ante `[WinError 32]` (15–20 ms), además de hilo daemon de limpieza en `BackgroundJobManager` y backoff `(1s, 2s, 4s)` en `bridge_messenger.py`.
-- [x] Suite completa de pruebas pasando al 100% en `.venv` (77/77 en 5.12s) y Python global (77/77 en 4.97s) sin contaminar `~/.bridge/live_inbox.json`.
+- [x] Concurrencia en `LiveInboxStore` protegida con `_STORE_LOCK` y reintentos `[WinError 32]`, hilo daemon de limpieza en `BackgroundJobManager` y backoff `(1s, 2s, 4s)` en `bridge_messenger.py`.
+- [x] Suite completa de pruebas pasando al 100% en `.venv` (87/87 en 5.67s) y Python global (87/87 en 5.47s) sin contaminar `~/.bridge/live_inbox.json` ni emitir sonidos de prueba.
 
 ## Etapa 1 — Configuración y Permisos por Defecto
 - [x] Modificar `src/codex_chatgpt_bridge/config.py` para defaults sin trabas (`trust_mode="full_delegate"`, `tool_profile="full"`, `enable_tasks=True`).
@@ -124,22 +127,33 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 **Validación:** `pytest tests` 100% verde en `.venv` (77/77) y Python global (77/77), `ruff check` limpio en módulos endurecidos y nuevos tests, `bridge status` ONLINE y `tools/list` en vivo reflejando perfil `delegate`.  
 **Finaliza cuando:** Todos los refuerzos estén implementados, validados y confirmados en vivo.
 
+## Etapa 11 — Canales Limpios, Puros y Ordenados (Cero Doble LLM, Mensajería Directa, Pitidos Silenciados en Tests y Escaping Seguro)
+- [x] **11.1 Canal directo de mensajería TUI (`bridge_inbox`), SSOT de visibilidad y orden lógico de herramientas (`config.py`, `gateway.py`, `mcp.py`, `bridge_messenger.py`)**: Centralizar `ordered_visible_tool_names()` como SSOT en `config.py`, agregar herramienta MCP directa `bridge_inbox` (`reply`, `state`, `pop`, `clear`) sin subprocesos ni LLM intermedio (con `"type": ["string", "null"]` limpio en `message`), incluir `bridge_inbox`/`exec_command`/`process_manager` en perfil `delegate` manteniendo ocultas las herramientas de archivos, y ordenar `tool_definitions()` por grupos claros (Estado/Chat -> Ejecución Directa -> Archivos -> Grants/Config -> Delegación Codex opcional).
+- [x] **11.2 Auto-notificación segura a la TUI, supresión de pitidos fantasma en tests y limpieza temporal (`gateway.py`, `live_inbox.py`, `bridge_messenger.py`, `tests/conftest.py`)**: Eliminar `patch_gateway.py` y el llamado sin guard en `gateway.py:1613`, extraer `_publish_codex_result_to_tui()` para `codex_task_run` y `_finish_codex_session_run` con guard `if cleaned_msg:` (sin `ValueError` en salidas vacías), aviso ante errores, `--skip-git-repo-check`, y suprimir `winsound.Beep` cuando `PYTEST_CURRENT_TEST` o `BRIDGE_DISABLE_BEEP` está activo (diagnóstico exacto de por qué se oían pitidos sin mensajes visibles durante runs previos de `pytest`).
+- [x] **11.3 Eliminación de fallos de escaping y multilínea en Windows (`process_runner.py`, `gateway.py`)**: Pasar scripts PowerShell con `-EncodedCommand` UTF-16LE, soportar `stdin_text` en `run_argv_captured()` con limpieza segura de `stdin_task` en timeout, desempaquetar shims `.cmd` de npm (`codex.CMD` -> `node.exe`) sin `cmd.exe`, y enviar prompts complejos/multilínea de Codex por `stdin` (`-`).
+- [x] **11.4 Canal puro por defecto respetado en CLI y daemon (`cli.py`, `C:\Users\LAZARINOS\bin\bridge.ps1`, `~/.bridge/config.toml`)**: Sincronizar `enable_tasks` y `enable_codex_tasks` en `_cmd_set_codex_tasks`, agregar `set-channel [pure|delegate|codex]` / `bridge channel [pure|delegate|codex]`, mostrar `channel_mode` en `doctor`/`bridge status`, aplicar `pure` en `~/.bridge/config.toml` y evitar que `bridge.ps1` sobreescriba elecciones posteriores del usuario.
+- [x] **11.5 Pruebas, regresión, validación en vivo y entrega**: Cubrir `bridge_inbox`, `-EncodedCommand` multilínea/comillas, `stdin_text`, shim unwrap `.cmd`, auto-notificación TUI vacía/no-vacía, supresión de pitidos bajo pytest y perfiles `full`/`delegate` con/sin `enable_tasks`; validar `.venv` + Python global (`87 passed`) + `ruff check` + verificación en vivo `/mcp` (`channel_mode: pure_direct`, 16 herramientas limpias, 0 herramientas de Codex Luna, `bridge_status` 37.5ms, `bridge_inbox` 25.4ms, `exec_command` multilínea/comillas `rc=0`) y actualizar documentación/git.
+
+**Validación:** `pytest tests` 100% verde en ambos intérpretes (`87 passed`), `ruff check` sin errores en módulos core/nuevos tests, y verificación en vivo `/mcp` (`channel_mode: pure_direct`, 16 herramientas sin Codex Luna).  
+**Finaliza cuando:** Todos los canales queden puros, limpios, ordenados y verificados en vivo.
+
 ## Bloqueos, riesgos y decisiones
-- **Decisión de compatibilidad (`config.py` vs `bridge.ps1`):** `BridgeConfig.tool_profile` se mantuvo en `"full"` para preservar contratos de pruebas unitarias existentes mientras `C:\Users\LAZARINOS\bin\bridge.ps1` auto-aplica `set-tool-profile delegate` por defecto (respetando cambios explícitos vía `bridge profile full` / `.profile_pin`).
-- **Aislamiento de tests (`tests/conftest.py`):** Se detectó que pruebas sin `config_path` escribían en `~/.bridge/live_inbox.json`; se aisló `HOME`/`USERPROFILE` mediante fixture `autouse` y se verificó `mtime` intacto.
-- **Limitación del entorno de ejecución:** Al reiniciar desde herramientas efímeras del agente no marcadas como daemon, Windows Job Objects terminan procesos hijos; el demonio en vivo quedó activo en segundo plano durante la sesión y el usuario puede relanzarlo permanentemente desde su terminal con `bridge`.
+- **Diagnóstico de sonidos sin texto en TUI:** `live_inbox.json` solo registraba 1 mensaje del agente (`20:25:05`), mientras los pitidos percibidos alrededor de `20:33:50` provenían de `LiveInboxStore.send_agent_reply()` ejecutando `winsound.Beep` en Windows durante las corridas de `pytest` sobre `tmp_path` y de que el daemon previo en `8766` aún servía el código anterior en perfil `delegate` antes del reinicio final. Mitigado con `_should_play_beep()`, guard en `bridge_messenger.py` y parche en `tests/conftest.py`.
+- **Decisión de compatibilidad (`config.py` vs `~/.bridge/config.toml`):** `BridgeConfig` conserva `enable_codex_tasks=True` en librería para no romper tests existentes de librería (`test_config.py`, `test_gateway.py`), mientras `bridge.ps1` inicializa nuevas configs en `pure` (`tool_profile="full"`, `enable_tasks=False`) y `~/.bridge/config.toml` quedó fijado en `pure`.
+- **Aislamiento de tests (`tests/conftest.py`):** Se verificó `MTIME_UNCHANGED=True` sobre `~/.bridge/live_inbox.json` antes y después de correr toda la suite de pytest.
+- **Ciclo de vida del demonio en Windows (`IsDaemon`):** El servidor activo (`PID 15996` en puerto `8766` con Funnel activo y TUI conectado) corre como tarea daemon gestionada por esta sesión; fuera de la sesión o tras reiniciar el PC, el usuario lo inicia de forma permanente con `bridge` o `bridge restart`.
 
 ## Evidencia de validación
 | Validación | Comando | Resultado |
 |---|---|---|
 | Compilación sintáctica | `.venv\Scripts\python.exe -m compileall -q src tests bridge_messenger.py` | **Exit 0** |
-| Linter Ruff (endurecidos + tests nuevos) | `.venv\Scripts\ruff.exe check src/codex_chatgpt_bridge/mcp.py src/codex_chatgpt_bridge/live_inbox.py src/codex_chatgpt_bridge/process_runner.py tests/test_live_inbox.py tests/test_process_runner.py tests/conftest.py` | **All checks passed!** |
-| Suite de Pruebas (`.venv` sin Pillow) | `.venv\Scripts\python.exe -m pytest tests` | **77 passed in 5.12s** (`live_inbox.json` intacto) |
-| Suite de Pruebas (Python global con Pillow) | `python -m pytest tests` | **77 passed in 4.97s** |
-| Diagnóstico CLI | `bridge doctor` | **Config ~/.bridge/config.toml, Profile: delegate, Trust: full_delegate, rg 15.2.0** |
-| Estado en Vivo y Túnel | `bridge status` | **ONLINE (HTTP 200), Funnel https://desktop-8jn135m.tail96313c.ts.net -> 8766** |
-| Inspección MCP en Vivo (`/mcp`) | `tools/list` + `bridge_status` + `bad_arg` | **4 herramientas (`delegate`), `additionalProperties: False`, safe annotations, `-32602` en arg inválido** |
-| Cero vestigios | `Select-String` en `src/` y `bridge_messenger.py` | **0 ocurrencias de `bridge_delegate`/`sandbox_mode`** |
+| Linter Ruff (módulos núcleo + Etapa 11) | `.venv\Scripts\ruff.exe check src\codex_chatgpt_bridge\config.py src\codex_chatgpt_bridge\process_runner.py src\codex_chatgpt_bridge\mcp.py src\codex_chatgpt_bridge\live_inbox.py tests\test_process_runner.py tests\test_cli.py tests\test_live_inbox.py tests\conftest.py` | **All checks passed!** |
+| Suite de Pruebas (`.venv` sin Pillow) | `.venv\Scripts\python.exe -m pytest tests -q` | **87 passed in 5.67s** (`live_inbox.json` intacto, 0 pitidos) |
+| Suite de Pruebas (Python global con Pillow) | `python -m pytest tests -q` | **87 passed in 5.47s** (`MTIME_UNCHANGED=True`) |
+| Diagnóstico CLI | `bridge doctor` | **Profile: full, Channel: pure_direct (0 intermediate LLM), Codex tasks: disabled, rg 15.2.0** |
+| Estado en Vivo y Túnel | `bridge status` | **ONLINE (PID 15996, HTTP 200), Channel: PURE DIRECT, Funnel https://desktop-8jn135m.tail96313c.ts.net -> 8766** |
+| Inspección MCP en Vivo (`/mcp` en PID 15996) | `tools/list`, `bridge_status`, `bridge_inbox(state)`, negativos (`-32602` / `-32000`) | **16 herramientas ordenadas en 26.5ms (`additionalProperties: False`, safe annotations, 0 Codex Luna), `bridge_status` 37.5ms (`pure_direct`), `bridge_inbox` 25.4ms** |
+| `exec_command` multilínea y comillas en vivo (`/mcp`) | `$x = 'hola & "mundo"'` + suma multilínea PowerShell `-EncodedCommand` | **Exit 0 en 557.9ms, stdout exacto sin errores de quoting** |
 | Ráfaga MCP Concurrente (histórico Etapa 7) | `benchmark_concurrency.py` (Escenario 1) | **50/50 llamadas en 2.84s (100% éxito)** |
 | I/O Paralelo de Archivos (histórico Etapa 7) | `benchmark_concurrency.py` (Escenario 2) | **20 escrituras (0.218s), 20 lecturas (0.158s), 20 ediciones (0.250s)** |
 | Búsquedas Ripgrep Paralelas (histórico Etapa 7) | `benchmark_concurrency.py` (Escenario 3) | **10 búsquedas en 0.648s** |
@@ -148,7 +162,7 @@ Transformar el conector/puente en un motor universal denominado limpiamente **Br
 | Consultas de Sesión Paralelas (histórico Etapa 7) | `benchmark_concurrency.py` (Escenario 6) | **20 consultas en 0.145s sin contención** |
 
 ## Resumen final
-- Completado: Endurecimiento MCP (`additionalProperties: False`, anotaciones seguras SSOT, `secrets.compare_digest`, JSON-RPC `-32602`), bloqueo `_STORE_LOCK` en `LiveInboxStore._load()` + reintentos 15–20 ms ante `[WinError 32]`, hilo daemon de limpieza en `BackgroundJobManager`, backoff exponencial `(1s, 2s, 4s)` y resiliencia TUI en `bridge_messenger.py`, corrección de fallback GDI en `view_image`, aislamiento de `HOME` en pytest, y perfil `delegate` aplicado automáticamente en `C:\Users\LAZARINOS\bin\bridge.ps1` + `restart-bridge.ps1`.
+- Completado: Canal puro directo activo (`pure_direct`, 16 herramientas ordenadas vía SSOT `ordered_visible_tool_names()`, 0 LLM Codex Luna intermedio), herramienta directa `bridge_inbox` (`reply`, `state`, `pop`, `clear`) en milisegundos sin subprocesos, `_publish_codex_result_to_tui()` seguro sin `ValueError` ante salidas vacías, supresión de `winsound.Beep` en tests (`_should_play_beep()` + `conftest.py`), ejecución PowerShell UTF-16LE `-EncodedCommand` + `stdin_text` + unwrap `.cmd` npm, comando `bridge channel [pure|delegate|codex]` / `set-channel`, 87/87 tests en `.venv` y Python global, y daemon reiniciado/verificado en vivo.
 - Pendiente: Ninguno.
 - Bloqueado: Ninguno.
-- Riesgos remanentes: `C:\Users\LAZARINOS\bin\bridge.ps1` reside fuera del repositorio git; la tolerancia de conexión del TUI en terminal interactiva TTY real (`msvcrt`) se validó mediante mocks y pruebas unitarias del controlador de polling.
+- Riesgos remanentes: `C:\Users\LAZARINOS\bin\bridge.ps1` reside fuera del repositorio git; la sesión TUI TTY real con `msvcrt` se verifica manualmente junto al servidor en vivo, mientras las transiciones de vista/reflow/backoff quedan cubiertas en `tests/test_bridge_messenger.py`. El demonio actual (`PID 15996`) corre bajo esta sesión y el usuario puede lanzarlo permanentemente desde su terminal con `bridge` o `bridge restart`.

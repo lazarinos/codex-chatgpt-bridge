@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import ToolProfile
+from .config import ToolProfile, ordered_visible_tool_names
 from .gateway import BridgeError, LocalGateway
 
 JsonObject = dict[str, Any]
@@ -167,6 +167,7 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
         raise ValueError("tools/call params.arguments must be an object")
     handlers: dict[str, Callable[..., Awaitable[JsonObject]]] = {
         "bridge_status": gateway.bridge_status,
+        "bridge_inbox": gateway.bridge_inbox,
         "set_bridge_mode": gateway.set_bridge_mode,
         "grant_path": gateway.grant_path,
         "revoke_grant": gateway.revoke_grant,
@@ -198,11 +199,17 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     handler = handlers.get(name)
     if handler is None:
         raise ValueError(f"unknown tool: {name}")
-    arg_preview = str(
-        arguments.get("path") or arguments.get("command") or arguments.get("action") or ""
-    )[:160]
-    with contextlib.suppress(Exception):
-        gateway.inbox_record_activity(name, arg_preview)
+    if name != "bridge_inbox":
+        arg_preview = str(
+            arguments.get("path")
+            or arguments.get("command")
+            or arguments.get("prompt")
+            or arguments.get("query")
+            or arguments.get("action")
+            or ""
+        )[:160]
+        with contextlib.suppress(Exception):
+            gateway.inbox_record_activity(name, arg_preview)
 
     global _ACTIVE_WORKERS, _PEAK_WORKERS, _TOTAL_CALLS, _TURN_CALLS
     with _METRICS_LOCK:
@@ -304,9 +311,43 @@ def tool_definitions(
             "name": "bridge_status",
             "title": "Bridge status",
             "description": (
-                "Check whether the local bridge is alive and which capabilities are available."
+                "Check bridge health, active channel mode (pure direct vs Codex delegation), "
+                "available tools, and unread TUI user messages."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        },
+        {
+            "name": "bridge_inbox",
+            "title": "Instant TUI messenger channel",
+            "description": (
+                "Send progress updates, answers, or questions directly to the user's live "
+                "Bridge TUI console ('bridge chat') or read/pop queued messages in ~5ms without "
+                "launching any subprocess or intermediate LLM."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["reply", "state", "pop", "clear"],
+                        "default": "reply",
+                    },
+                    "message": {
+                        "type": ["string", "null"],
+                        "maxLength": 20000,
+                        "default": None,
+                        "description": "Message text shown in the live TUI when action='reply'.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 25,
+                    },
+                },
+                "additionalProperties": False,
+            },
             "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
         },
         {
@@ -573,8 +614,9 @@ def tool_definitions(
             "name": "exec_command",
             "title": "Execute local command",
             "description": (
-                "Execute a PowerShell, CMD, Python, or shell command directly on the local "
-                "computer with hang protection and automatic backgrounding for long tasks."
+                "Execute a direct PowerShell, CMD, Python, or shell command on the local machine "
+                "in ~20ms with zero intermediate LLM latency, UTF-16LE encoding safety on Windows, "
+                "hang protection, and automatic backgrounding for long tasks."
             ),
             "inputSchema": {
                 "type": "object",
@@ -664,8 +706,9 @@ def tool_definitions(
     ]
     if enable_codex_tasks:
         tools.extend(_bridge_task_tool_definitions())
-    names = visible_tool_names(enable_codex_tasks, tool_profile=tool_profile)
-    tools = [tool for tool in tools if tool["name"] in names]
+    ordered_names = ordered_visible_tool_names(enable_codex_tasks, tool_profile=tool_profile)
+    by_name = {tool["name"]: tool for tool in tools}
+    tools = [by_name[name] for name in ordered_names if name in by_name]
     for tool in tools:
         schema = tool.get("inputSchema")
         if isinstance(schema, dict) and schema.get("type") == "object":
@@ -687,41 +730,9 @@ def tool_definitions(
 
 
 def visible_tool_names(enable_codex_tasks: bool, *, tool_profile: ToolProfile = "full") -> set[str]:
-    """Return the tool names visible to the AI agent for the selected profile."""
+    """Return the tool names visible to the AI agent for the selected profile (SSOT)."""
 
-    if tool_profile == "delegate":
-        names = {"bridge_status"}
-        if enable_codex_tasks:
-            names.update({"bridge_task_run", "bridge_session_list", "bridge_session_status"})
-        return names
-    names = {
-        "bridge_status",
-        "set_bridge_mode",
-        "grant_path",
-        "revoke_grant",
-        "list_grants",
-        "search_files",
-        "read_file",
-        "view_image",
-        "write_file",
-        "list_dir",
-        "edit_file",
-        "file_ops",
-        "exec_command",
-        "process_manager",
-        "system_info",
-    }
-    if enable_codex_tasks:
-        names.update(
-            {
-                "bridge_task_run",
-                "bridge_session_start",
-                "bridge_session_continue",
-                "bridge_session_list",
-                "bridge_session_status",
-            }
-        )
-    return names
+    return set(ordered_visible_tool_names(enable_codex_tasks, tool_profile=tool_profile))
 
 
 def _bridge_task_tool_definitions() -> list[JsonObject]:
@@ -730,7 +741,10 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
             "name": "bridge_task_run",
             "title": "Run local task",
             "description": (
-                "Execute one bounded task directly in an approved local directory."
+                "Delegate an autonomous multi-step AI task to the local Codex CLI agent "
+                "(adds Codex LLM startup latency; auto-posts final summary to Bridge TUI). "
+                "For direct shell/Python/PowerShell commands use exec_command; for instant chat "
+                "updates use bridge_inbox."
             ),
             "inputSchema": {
                 "type": "object",

@@ -503,6 +503,7 @@ class TuiRenderer:
         "list_dir": "List",
         "file_ops": "FileOps",
         "bridge_status": "Status",
+        "bridge_inbox": "Chat",
         "bridge_task_run": "Task",
         "bridge_session_start": "Session",
         "bridge_session_continue": "Session",
@@ -1503,14 +1504,21 @@ class MessengerController:
                 self.consolidator.flush()
 
                 if sender == "agent":
-                    def _beep_agent() -> None:
-                        try:
-                            import winsound
-                            winsound.Beep(880, 110)
-                            winsound.Beep(1175, 140)
-                        except Exception:
-                            pass
-                    threading.Thread(target=_beep_agent, daemon=True).start()
+                    if (
+                        not os.environ.get("PYTEST_CURRENT_TEST")
+                        and os.environ.get("BRIDGE_DISABLE_BEEP", "").strip().lower()
+                        not in {"1", "true", "yes", "on"}
+                    ):
+                        def _beep_agent() -> None:
+                            try:
+                                import winsound
+
+                                winsound.Beep(880, 110)
+                                winsound.Beep(1175, 140)
+                            except Exception:
+                                pass
+
+                        threading.Thread(target=_beep_agent, daemon=True).start()
                     self.record_and_print_event(FeedEvent(kind="agent", timestamp=ts, text=txt))
                 else:
                     if m.get("read_by_agent"):

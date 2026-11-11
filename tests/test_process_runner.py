@@ -99,3 +99,50 @@ async def test_clear_finished_reaps_dead_orphaned_pid(
     assert task1.cancelled()
     assert task2.cancelled()
     assert sys.version_info >= (3, 11)
+
+
+def test_build_shell_command_uses_encoded_command_for_powershell() -> None:
+    import base64
+
+    script = 'Write-Output "hello \'world\'"\nWrite-Output "line2"'
+    argv, resolved_shell = process_runner.build_shell_command(script, shell="powershell")
+
+    assert resolved_shell == "powershell"
+    assert "-EncodedCommand" in argv
+    enc_idx = argv.index("-EncodedCommand") + 1
+    decoded = base64.b64decode(argv[enc_idx]).decode("utf-16-le")
+    assert script in decoded
+
+
+@pytest.mark.asyncio
+async def test_run_argv_captured_delivers_multiline_utf8_stdin(tmp_path: Path) -> None:
+    payload = 'linea 1 "comillas"\nlinea 2 \'simple\' & | > %PCT% ñ á\n'
+    rc, stdout, stderr = await process_runner.run_argv_captured(
+        [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        cwd=tmp_path,
+        timeout_s=5.0,
+        stdin_text=payload,
+    )
+    assert rc == 0
+    assert stderr == ""
+    assert stdout.replace("\r\n", "\n") == payload
+
+
+def test_resolve_windows_command_argv_unwraps_npm_cmd_shim(tmp_path: Path) -> None:
+    if process_runner.os.name != "nt":
+        pytest.skip("Windows-specific npm .cmd shim resolution")
+    pkg_bin = tmp_path / "node_modules" / "@openai" / "codex" / "bin"
+    pkg_bin.mkdir(parents=True)
+    js_entry = pkg_bin / "codex.js"
+    js_entry.write_text("console.log('ok');", encoding="utf-8")
+    fake_node = tmp_path / "node.exe"
+    fake_node.write_text("", encoding="utf-8")
+    shim = tmp_path / "codex.CMD"
+    shim.write_text(
+        '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
+        encoding="utf-8",
+    )
+
+    resolved = process_runner._resolve_windows_command_argv([str(shim), "exec", "--version"])
+    assert resolved == [str(fake_node), str(js_entry.resolve()), "exec", "--version"]
+

@@ -95,6 +95,14 @@ def _dedup_messages(messages: list[JsonObject]) -> tuple[list[JsonObject], bool]
     return deduped, changed
 
 
+def _should_play_beep() -> bool:
+    """Suppress hardware audio cues during automated test runs or explicit silent mode."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    flag = os.environ.get("BRIDGE_DISABLE_BEEP", "").strip().lower()
+    return flag not in {"1", "true", "yes", "on"}
+
+
 class LiveInboxStore:
     """Persistent, atomic message queue allowing the user to send live instructions mid-loop."""
 
@@ -245,14 +253,15 @@ class LiveInboxStore:
             data["messages"].append(msg)
             self._save(data)
 
-        def _beep_async() -> None:
-            with contextlib.suppress(Exception):
-                import winsound
+        if _should_play_beep():
+            def _beep_async() -> None:
+                with contextlib.suppress(Exception):
+                    import winsound
 
-                winsound.Beep(880, 110)
-                winsound.Beep(1175, 140)
+                    winsound.Beep(880, 110)
+                    winsound.Beep(1175, 140)
 
-        threading.Thread(target=_beep_async, daemon=True).start()
+            threading.Thread(target=_beep_async, daemon=True).start()
         return msg
 
     def pop_unread_for_agent(self, *, tool_name: str) -> list[JsonObject]:

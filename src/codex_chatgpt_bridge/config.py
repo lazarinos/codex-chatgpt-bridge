@@ -12,6 +12,59 @@ from pydantic import BaseModel, Field, model_validator
 TrustMode = Literal["restricted", "full_delegate"]
 ToolProfile = Literal["full", "delegate"]
 
+_DELEGATE_CORE_TOOLS: tuple[str, ...] = (
+    "bridge_status",
+    "bridge_inbox",
+    "exec_command",
+    "process_manager",
+)
+_DELEGATE_TASK_TOOLS: tuple[str, ...] = (
+    "bridge_task_run",
+    "bridge_session_list",
+    "bridge_session_status",
+)
+_FULL_CORE_TOOLS: tuple[str, ...] = (
+    "bridge_status",
+    "bridge_inbox",
+    "exec_command",
+    "process_manager",
+    "system_info",
+    "read_file",
+    "edit_file",
+    "write_file",
+    "search_files",
+    "list_dir",
+    "file_ops",
+    "view_image",
+    "list_grants",
+    "grant_path",
+    "revoke_grant",
+    "set_bridge_mode",
+)
+_FULL_TASK_TOOLS: tuple[str, ...] = (
+    "bridge_task_run",
+    "bridge_session_start",
+    "bridge_session_continue",
+    "bridge_session_list",
+    "bridge_session_status",
+)
+
+
+def ordered_visible_tool_names(
+    enable_codex_tasks: bool,
+    *,
+    tool_profile: ToolProfile = "full",
+) -> tuple[str, ...]:
+    """Return ordered MCP tool names visible for the given profile and task toggle (SSOT)."""
+
+    if tool_profile == "delegate":
+        return (
+            _DELEGATE_CORE_TOOLS + _DELEGATE_TASK_TOOLS
+            if enable_codex_tasks
+            else _DELEGATE_CORE_TOOLS
+        )
+    return _FULL_CORE_TOOLS + _FULL_TASK_TOOLS if enable_codex_tasks else _FULL_CORE_TOOLS
+
 
 class BridgeGrant(BaseModel):
     """One user-approved local path grant."""

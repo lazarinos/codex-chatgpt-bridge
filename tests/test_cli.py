@@ -278,6 +278,7 @@ def test_cli_enable_and_disable_tasks(
     main()
     loaded = load_config(config_path)
     assert loaded.enable_codex_tasks is True
+    assert loaded.enable_tasks is True
 
     monkeypatch.setattr(
         sys,
@@ -287,6 +288,35 @@ def test_cli_enable_and_disable_tasks(
     main()
     loaded = load_config(config_path)
     assert loaded.enable_codex_tasks is False
+    assert loaded.enable_tasks is False
+
+
+def test_cli_set_channel_pure_delegate_and_codex(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    save_config(BridgeConfig(), config_path)
+
+    for channel, exp_profile, exp_tasks in (
+        ("pure", "full", False),
+        ("delegate", "delegate", False),
+        ("codex", "full", True),
+    ):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["bridge", "--config", str(config_path), "set-channel", channel],
+        )
+        main()
+        loaded = load_config(config_path)
+        assert loaded.tool_profile == exp_profile
+        assert loaded.enable_tasks is exp_tasks
+        assert loaded.enable_codex_tasks is exp_tasks
+
+    captured = capsys.readouterr()
+    assert "Set bridge channel: pure" in captured.out
 
 
 def test_cli_print_setup(

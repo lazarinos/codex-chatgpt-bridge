@@ -34,12 +34,14 @@ from .config import (
     add_grant,
     default_config_path,
     load_config,
+    ordered_visible_tool_names,
     save_config,
 )
 from .live_inbox import LiveInboxStore, default_inbox_path
 from .process_runner import BackgroundJobManager, ShellKind, kill_process_tree, run_argv_captured
 from .security import is_relative_to, is_sensitive_path, resolve_user_path
 
+InboxAction = Literal["reply", "state", "pop", "clear"]
 ProcessAction = Literal[
     "list_jobs",
     "job_status",
@@ -204,12 +206,16 @@ class LocalGateway:
         """Return bridge status and capabilities."""
 
         self._maybe_reload_config()
+        channel_mode = (
+            "codex_delegate_enabled" if self._config.enable_codex_tasks else "pure_direct"
+        )
         return {
             "status": "ok",
             "host": self._config.host,
             "port": self._config.port,
             "trust_mode": self._config.trust_mode,
             "tool_profile": self._config.tool_profile,
+            "channel_mode": channel_mode,
             "grant_count": len(self._config.grants),
             "auth_required": True,
             "tasks_enabled": self._config.enable_codex_tasks,
@@ -219,11 +225,62 @@ class LocalGateway:
             ),
             "unread_user_messages": len(self._inbox_store.peek_unread_for_agent()),
             "live_inbox_enabled": True,
-            "bridge_chat_channel": "active (consola interactiva 'bridge chat' conectada a live_inbox.json)",
+            "bridge_chat_channel": (
+                "active (consola interactiva 'bridge chat' conectada a live_inbox.json)"
+            ),
+            "execution_channels": {
+                "instant_tui_chat": "bridge_inbox (~5ms, zero subprocess)",
+                "direct_command": "exec_command (~20ms, zero intermediate LLM)",
+                **(
+                    {"codex_delegation": "bridge_task_run (local Codex CLI)"}
+                    if self._config.enable_codex_tasks
+                    else {}
+                ),
+            },
             "ripgrep_available": find_rg_path() is not None,
             "search_engine": "ripgrep" if find_rg_path() else "python_native",
             "tools": self._visible_tool_names(),
         }
+
+    async def bridge_inbox(
+        self,
+        *,
+        action: InboxAction = "reply",
+        message: str | None = None,
+        limit: int = 25,
+    ) -> JsonObject:
+        """Instant bi-directional TUI chat channel without subprocess or LLM overhead."""
+
+        self._maybe_reload_config()
+        if limit <= 0:
+            raise BridgeError("limit must be >= 1")
+        capped_limit = min(limit, 200)
+
+        if action == "reply":
+            cleaned = (message or "").strip()
+            if not cleaned:
+                raise BridgeError("message must not be empty for action='reply'")
+            if len(cleaned) > 20_000:
+                raise BridgeError("message exceeds 20000 characters")
+            sent = await asyncio.to_thread(self._inbox_store.send_agent_reply, cleaned)
+            state = await asyncio.to_thread(self._inbox_store.get_state, limit=capped_limit)
+            return {"status": "sent", "message": sent, "inbox": state}
+
+        if action == "state":
+            return await asyncio.to_thread(self._inbox_store.get_state, limit=capped_limit)
+
+        if action == "pop":
+            popped = await asyncio.to_thread(
+                self._inbox_store.pop_unread_for_agent,
+                tool_name="bridge_inbox",
+            )
+            state = await asyncio.to_thread(self._inbox_store.get_state, limit=capped_limit)
+            return {"popped_messages": popped, "inbox": state}
+
+        if action == "clear":
+            return await asyncio.to_thread(self._inbox_store.clear)
+
+        raise BridgeError(f"unsupported bridge_inbox action: {action}")
 
     def inbox_send_user_message(self, text: str, *, priority: str = "normal") -> JsonObject:
         """Queue a live message from the user without interrupting the agent work loop."""
@@ -250,47 +307,12 @@ class LocalGateway:
         return self._inbox_store.clear()
 
     def _visible_tool_names(self) -> list[str]:
-        if self._config.tool_profile == "delegate":
-            return [
-                "bridge_status",
-                *(
-                    [
-                        "bridge_task_run",
-                        "bridge_session_list",
-                        "bridge_session_status",
-                    ]
-                    if self._config.enable_codex_tasks
-                    else []
-                ),
-            ]
-        return [
-            "bridge_status",
-            "set_bridge_mode",
-            "grant_path",
-            "revoke_grant",
-            "list_grants",
-            "search_files",
-            "read_file",
-            "view_image",
-            "write_file",
-            "list_dir",
-            "edit_file",
-            "file_ops",
-            "exec_command",
-            "process_manager",
-            "system_info",
-            *(["bridge_task_run"] if self._config.enable_codex_tasks else []),
-            *(
-                [
-                    "bridge_session_start",
-                    "bridge_session_continue",
-                    "bridge_session_list",
-                    "bridge_session_status",
-                ]
-                if self._config.enable_codex_tasks
-                else []
-            ),
-        ]
+        return list(
+            ordered_visible_tool_names(
+                self._config.enable_codex_tasks,
+                tool_profile=self._config.tool_profile,
+            )
+        )
 
     async def list_grants(self) -> JsonObject:
         """List configured grants."""
@@ -1476,6 +1498,7 @@ class LocalGateway:
             raise BridgeError("prompt must not be empty")
         resolved_cwd = self._authorize_codex_cwd(cwd)
         output_path = self._new_output_path()
+        prompt_arg, stdin_prompt = self._prepare_codex_prompt(prompt)
         command = [
             self._codex_path(),
             "exec",
@@ -1486,7 +1509,7 @@ class LocalGateway:
             "--output-last-message",
             str(output_path),
             *self._codex_permission_args(),
-            prompt,
+            prompt_arg,
         ]
         return await self._finish_codex_session_run(
             command=command,
@@ -1495,6 +1518,7 @@ class LocalGateway:
             prompt=prompt,
             cwd=resolved_cwd,
             existing_record=None,
+            stdin_text=stdin_prompt,
         )
 
     async def codex_session_continue(
@@ -1521,6 +1545,7 @@ class LocalGateway:
             raise BridgeError(f"record has no Codex session id: {record.bridge_session_id}")
         resolved_cwd = self._authorize_codex_cwd(record.cwd)
         output_path = self._new_output_path()
+        prompt_arg, stdin_prompt = self._prepare_codex_prompt(prompt)
         command = [
             self._codex_path(),
             "exec",
@@ -1531,7 +1556,7 @@ class LocalGateway:
             str(output_path),
             *self._codex_resume_permission_args(),
             record.codex_session_id,
-            prompt,
+            prompt_arg,
         ]
         return await self._finish_codex_session_run(
             command=command,
@@ -1540,6 +1565,7 @@ class LocalGateway:
             prompt=prompt,
             cwd=resolved_cwd,
             existing_record=record,
+            stdin_text=stdin_prompt,
         )
 
     async def codex_session_list(self) -> JsonObject:
@@ -1576,28 +1602,33 @@ class LocalGateway:
             raise BridgeError("prompt must not be empty")
         resolved_cwd = self._authorize(cwd, read=True, write=True, execute=True)
         codex_path = self._codex_path()
-        with tempfile.NamedTemporaryFile(
-            prefix="bridge-",
-            suffix=".txt",
-            delete=False,
-        ) as handle:
-            output_path = Path(handle.name)
+        output_path = self._new_output_path()
+        prompt_arg, stdin_prompt = self._prepare_codex_prompt(prompt)
         command = [
             codex_path,
             "exec",
             "--cd",
             str(resolved_cwd),
+            "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
             "--output-last-message",
             str(output_path),
-            prompt,
+            prompt_arg,
         ]
         try:
-            returncode, stdout, stderr = await run_argv_captured(
-                command,
-                cwd=resolved_cwd,
-                timeout_s=wait_timeout_s,
-            )
+            if stdin_prompt is not None:
+                returncode, stdout, stderr = await run_argv_captured(
+                    command,
+                    cwd=resolved_cwd,
+                    timeout_s=wait_timeout_s,
+                    stdin_text=stdin_prompt,
+                )
+            else:
+                returncode, stdout, stderr = await run_argv_captured(
+                    command,
+                    cwd=resolved_cwd,
+                    timeout_s=wait_timeout_s,
+                )
         except TimeoutError as exc:
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
             raise BridgeError(f"task timed out after {wait_timeout_s} seconds") from exc
@@ -1610,6 +1641,16 @@ class LocalGateway:
                 errors="replace",
             )
             await asyncio.to_thread(output_path.unlink, missing_ok=True)
+
+        self._publish_codex_result_to_tui(
+            tool_name="bridge_task_run",
+            prompt=prompt,
+            cwd=resolved_cwd,
+            returncode=returncode,
+            final_message=final_message,
+            stdout=stdout,
+            stderr=stderr,
+        )
         return {
             "cwd": str(resolved_cwd),
             "returncode": returncode,
@@ -1617,6 +1658,60 @@ class LocalGateway:
             "stdout_tail": stdout[-8000:],
             "stderr_tail": stderr[-8000:],
         }
+
+    @staticmethod
+    def _prepare_codex_prompt(prompt: str) -> tuple[str, str | None]:
+        """Pass multiline, long, or shell-sensitive prompts over stdin ('-')."""
+        if (
+            "\n" in prompt
+            or "\r" in prompt
+            or len(prompt) > 1000
+            or any(ch in prompt for ch in ('"', "'", "`", "$", "%", "&", "|", "<", ">", "^", "\\"))
+        ):
+            return ("-", prompt)
+        return (prompt, None)
+
+    def _publish_codex_result_to_tui(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        cwd: Path,
+        returncode: int,
+        final_message: str,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        """Record signal-only task telemetry and safely push non-empty summaries into TUI chat."""
+        with contextlib.suppress(Exception):
+            cwd_name = cwd.name or str(cwd)
+            prompt_preview = " ".join(prompt.strip().split())[:180]
+            status_label = "ok" if returncode == 0 else "error"
+            detail_lines = [f"Exit {returncode} ({status_label}) · cwd: {cwd_name}"]
+            cleaned_msg = final_message.strip()
+            if cleaned_msg:
+                for ln in cleaned_msg.splitlines()[:6]:
+                    detail_lines.append(f"> {ln[:108]}")
+            elif stderr.strip():
+                for ln in stderr.strip().splitlines()[-4:]:
+                    detail_lines.append(f"! {ln[:108]}")
+            self._inbox_store.record_agent_activity(
+                tool_name,
+                prompt_preview,
+                "\n".join(detail_lines),
+            )
+            if cleaned_msg:
+                summary_reply = (
+                    cleaned_msg if len(cleaned_msg) <= 1000 else f"{cleaned_msg[:997].rstrip()}..."
+                )
+                self._inbox_store.send_agent_reply(summary_reply)
+            elif returncode != 0:
+                diag_lines = [ln.strip() for ln in (stderr or stdout).splitlines() if ln.strip()]
+                diag_tail = " ".join(diag_lines[-3:])[:300]
+                notice = f"[{tool_name}] exited with code {returncode}"
+                if diag_tail:
+                    notice = f"{notice}: {diag_tail}"
+                self._inbox_store.send_agent_reply(notice)
 
     def _authorize_codex_cwd(self, cwd: str) -> Path:
         return self._authorize(cwd, read=True, write=True, execute=True)
@@ -1650,13 +1745,23 @@ class LocalGateway:
         prompt: str,
         cwd: Path,
         existing_record: CodexSessionRecord | None,
+        stdin_text: str | None = None,
     ) -> JsonObject:
-        returncode, stdout, stderr = await self._run_codex_command(
-            command,
-            output_path,
-            wait_timeout_s,
-            cwd,
-        )
+        if stdin_text is not None:
+            returncode, stdout, stderr = await self._run_codex_command(
+                command,
+                output_path,
+                wait_timeout_s,
+                cwd,
+                stdin_text=stdin_text,
+            )
+        else:
+            returncode, stdout, stderr = await self._run_codex_command(
+                command,
+                output_path,
+                wait_timeout_s,
+                cwd,
+            )
         final_message = ""
         if output_path.exists():
             final_message = await asyncio.to_thread(
@@ -1683,6 +1788,19 @@ class LocalGateway:
             last_returncode=returncode,
         )
         self._session_store.upsert(record)
+        self._publish_codex_result_to_tui(
+            tool_name=(
+                "bridge_session_continue"
+                if existing_record is not None
+                else "bridge_session_start"
+            ),
+            prompt=prompt,
+            cwd=cwd,
+            returncode=returncode,
+            final_message=final_message,
+            stdout=stdout,
+            stderr=stderr,
+        )
         return {
             "bridge_session_id": record.bridge_session_id,
             "session_id": record.codex_session_id,
@@ -1700,8 +1818,16 @@ class LocalGateway:
         output_path: Path,
         wait_timeout_s: float,
         cwd: Path,
+        stdin_text: str | None = None,
     ) -> tuple[int, str, str]:
         try:
+            if stdin_text is not None:
+                return await run_argv_captured(
+                    command,
+                    cwd=cwd,
+                    timeout_s=wait_timeout_s,
+                    stdin_text=stdin_text,
+                )
             return await run_argv_captured(
                 command,
                 cwd=cwd,

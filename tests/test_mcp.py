@@ -143,6 +143,9 @@ def test_delegate_tool_profile_exposes_single_action_tool(tmp_path: Path) -> Non
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
     assert names == {
         "bridge_status",
+        "bridge_inbox",
+        "exec_command",
+        "process_manager",
         "bridge_task_run",
         "bridge_session_list",
         "bridge_session_status",
@@ -424,7 +427,7 @@ def test_delegate_profile_enforces_closed_schemas_and_safe_annotations(tmp_path:
     )
     assert response.status_code == 200
     tools = response.json()["result"]["tools"]
-    assert len(tools) == 4
+    assert len(tools) == 7
     for t in tools:
         assert t["annotations"] == {
             "readOnlyHint": True,
@@ -504,4 +507,98 @@ def test_tools_call_view_image_without_pillow_preserves_small_png(
     res = response.json()["result"]
     assert res["content"][1]["mimeType"] == "image/png"
     assert res["structuredContent"]["mime_type"] == "image/png"
+
+
+def test_pure_direct_channel_hides_codex_tools_and_orders_cleanly(tmp_path: Path) -> None:
+    config = BridgeConfig(
+        auth_token="test-token",
+        enable_codex_tasks=False,
+        tool_profile="full",
+        trust_mode="full_delegate",
+        grants=[BridgeGrant(path=tmp_path)],
+    )
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    list_resp = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert list_resp.status_code == 200
+    ordered_names = [t["name"] for t in list_resp.json()["result"]["tools"]]
+    assert ordered_names[:5] == [
+        "bridge_status",
+        "bridge_inbox",
+        "exec_command",
+        "process_manager",
+        "system_info",
+    ]
+    assert "bridge_task_run" not in ordered_names
+    assert "bridge_session_start" not in ordered_names
+    assert "bridge_session_continue" not in ordered_names
+
+    status_resp = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "bridge_status", "arguments": {}},
+        },
+    )
+    assert status_resp.status_code == 200
+    sc = status_resp.json()["result"]["structuredContent"]
+    assert sc["channel_mode"] == "pure_direct"
+    assert "instant_tui_chat" in sc["execution_channels"]
+    assert "codex_delegation" not in sc["execution_channels"]
+
+
+def test_tools_call_bridge_inbox_reply_pop_and_validation(tmp_path: Path) -> None:
+    config = BridgeConfig(
+        auth_token="test-token",
+        enable_codex_tasks=False,
+        tool_profile="delegate",
+        trust_mode="full_delegate",
+    )
+    gateway = LocalGateway(config, config_path=tmp_path / "config.toml")
+    gateway.inbox_send_user_message("hola desde tui", priority="high")
+    app = create_app(gateway)
+    client = TestClient(app)
+
+    reply_resp = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "bridge_inbox",
+                "arguments": {"action": "reply", "message": "Respuesta instantanea"},
+            },
+        },
+    )
+    assert reply_resp.status_code == 200
+    sc = reply_resp.json()["result"]["structuredContent"]
+    assert sc["status"] == "sent"
+    assert sc["message"]["text"] == "Respuesta instantanea"
+    assert sc["user_messages"][0]["text"] == "hola desde tui"
+    # Sending via bridge_inbox should not clutter action_log with redundant chat noise
+    assert gateway.inbox_state()["action_log"] == []
+
+    bad_resp = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {"name": "bridge_inbox", "arguments": {"action": "reply", "message": "   "}},
+        },
+    )
+    assert bad_resp.status_code == 200
+    assert bad_resp.json()["error"]["code"] == -32000
+
 

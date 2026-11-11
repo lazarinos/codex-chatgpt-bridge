@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ctypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,8 +70,24 @@ def build_shell_command(command: str, shell: ShellKind = "auto") -> tuple[list[s
             "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
             "$OutputEncoding = [System.Text.Encoding]::UTF8; "
-            "$ProgressPreference = 'SilentlyContinue'; "
+            "$ProgressPreference = 'SilentlyContinue';"
         )
+        full_script = f"{utf8_prelude}\n{command}"
+        encoded = base64.b64encode(full_script.encode("utf-16-le")).decode("ascii")
+        if len(encoded) <= 24_000:
+            return (
+                [
+                    ps_bin,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                "powershell",
+            )
         return (
             [
                 ps_bin,
@@ -79,7 +97,7 @@ def build_shell_command(command: str, shell: ShellKind = "auto") -> tuple[list[s
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                f"{utf8_prelude}{command}",
+                f"{utf8_prelude} {command}",
             ],
             "powershell",
         )
@@ -603,22 +621,66 @@ class BackgroundJobManager:
         return len(to_remove)
 
 
+_NPM_CMD_SHIM_RE = re.compile(
+    r'"%_prog%"\s+"%(?:~)?dp0%\\([^"\r\n]+\.(?:js|mjs|cjs))"\s+%\*',
+    re.IGNORECASE,
+)
+
+
+def _resolve_windows_command_argv(command: list[str]) -> list[str]:
+    """Bypass cmd.exe for npm .cmd JS wrappers when node and script resolve directly."""
+    effective_cmd = list(command)
+    if (
+        os.name != "nt"
+        or not effective_cmd
+        or not effective_cmd[0].lower().endswith((".cmd", ".bat"))
+    ):
+        return effective_cmd
+
+    cmd_path = Path(effective_cmd[0])
+    with contextlib.suppress(OSError):
+        if cmd_path.is_file() and cmd_path.stat().st_size <= 8192:
+            shim_text = cmd_path.read_text(encoding="utf-8", errors="replace")
+            match = _NPM_CMD_SHIM_RE.search(shim_text)
+            if match:
+                rel_script = match.group(1).replace("\\", os.sep)
+                script_path = (cmd_path.parent / rel_script).resolve(strict=False)
+                local_node = cmd_path.parent / "node.exe"
+                node_bin = str(local_node) if local_node.is_file() else shutil.which("node")
+                if node_bin and script_path.is_file():
+                    return [node_bin, str(script_path), *effective_cmd[1:]]
+
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    return [comspec, "/d", "/s", "/c", *effective_cmd]
+
+
+async def _feed_stdin(process: asyncio.subprocess.Process, text: str) -> None:
+    if process.stdin is None:
+        return
+    try:
+        process.stdin.write(text.encode("utf-8", errors="replace"))
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            process.stdin.close()
+
+
 async def run_argv_captured(
     command: list[str],
     *,
     cwd: Path,
     timeout_s: float,
     env: dict[str, str] | None = None,
+    stdin_text: str | None = None,
 ) -> tuple[int, str, str]:
     """Run an explicit argv command with hang-proof stream collection and tree-kill on timeout."""
 
-    effective_cmd = list(command)
-    if os.name == "nt" and effective_cmd and effective_cmd[0].lower().endswith((".cmd", ".bat")):
-        comspec = os.environ.get("COMSPEC", "cmd.exe")
-        effective_cmd = [comspec, "/d", "/s", "/c", *effective_cmd]
+    effective_cmd = _resolve_windows_command_argv(command)
 
     kwargs: dict[str, Any] = {
-        "stdin": asyncio.subprocess.DEVNULL,
+        "stdin": asyncio.subprocess.PIPE if stdin_text is not None else asyncio.subprocess.DEVNULL,
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.PIPE,
         "cwd": str(cwd),
@@ -635,12 +697,26 @@ async def run_argv_captured(
     stderr_buf = StreamBuffer(max_chars=400_000)
     stdout_task = asyncio.create_task(_pump_stream(process.stdout, stdout_buf))
     stderr_task = asyncio.create_task(_pump_stream(process.stderr, stderr_buf))
+    stdin_task = (
+        asyncio.create_task(_feed_stdin(process, stdin_text)) if stdin_text is not None else None
+    )
+
+    async def _wait_for_completion() -> None:
+        if stdin_task is not None:
+            await stdin_task
+        await process.wait()
+
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout_s)
+        await asyncio.wait_for(_wait_for_completion(), timeout=timeout_s)
     except TimeoutError:
+        if stdin_task is not None and not stdin_task.done():
+            stdin_task.cancel()
         await kill_process_tree(process)
         with contextlib.suppress(TimeoutError, Exception):
             await asyncio.wait_for(process.wait(), timeout=2.0)
+        if stdin_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stdin_task
         for task in (stdout_task, stderr_task):
             if not task.done():
                 task.cancel()

@@ -443,3 +443,119 @@ async def test_edit_file_list_dir_file_ops_and_shortcuts(tmp_path: Path) -> None
     py_res = await gateway.read_file(path="py:print(21 * 2)")
     parsed_py = json.loads(py_res["text"])
     assert parsed_py["stdout"].strip() == "42"
+
+
+@pytest.mark.asyncio
+async def test_codex_task_run_auto_notifies_tui_and_handles_empty_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = LocalGateway(
+        BridgeConfig(trust_mode="full_delegate", enable_codex_tasks=True),
+        config_path=tmp_path / "config.toml",
+        session_store_path=tmp_path / "sessions.json",
+    )
+
+    scenario = {"mode": "non_empty"}
+
+    async def fake_run_argv(
+        command: list[str],
+        cwd: Path,
+        timeout_s: float,
+    ) -> tuple[int, str, str]:
+        assert "--skip-git-repo-check" in command
+        out_idx = command.index("--output-last-message") + 1
+        out_file = Path(command[out_idx])
+        if scenario["mode"] == "non_empty":
+            out_file.write_text("  Resumen listo en TUI  \n", encoding="utf-8")
+            return (0, "ok", "")
+        if scenario["mode"] == "empty_error":
+            return (2, "", "fatal: syntax error in target")
+        return (0, "", "")
+
+    monkeypatch.setattr("codex_chatgpt_bridge.gateway.run_argv_captured", fake_run_argv)
+    monkeypatch.setattr(gateway, "_codex_path", lambda: "/usr/local/bin/codex")
+
+    ok_res = await gateway.codex_task_run(prompt="check status", cwd=str(tmp_path))
+    assert ok_res["returncode"] == 0
+    msgs = gateway.inbox_state()["messages"]
+    assert msgs[-1]["sender"] == "agent"
+    assert msgs[-1]["text"] == "Resumen listo en TUI"
+
+    scenario["mode"] = "empty_error"
+    err_res = await gateway.codex_task_run(prompt="broken task", cwd=str(tmp_path))
+    assert err_res["returncode"] == 2
+    msgs_after_err = gateway.inbox_state()["messages"]
+    assert "exited with code 2" in msgs_after_err[-1]["text"]
+    assert "syntax error in target" in msgs_after_err[-1]["text"]
+
+    scenario["mode"] = "empty_ok"
+    count_before = len(gateway.inbox_state()["messages"])
+    quiet_res = await gateway.codex_task_run(prompt="quiet task", cwd=str(tmp_path))
+    assert quiet_res["returncode"] == 0
+    assert quiet_res["final_message"] == ""
+    assert len(gateway.inbox_state()["messages"]) == count_before
+
+
+@pytest.mark.asyncio
+async def test_codex_task_and_session_pass_complex_prompt_via_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = LocalGateway(
+        BridgeConfig(trust_mode="full_delegate", enable_codex_tasks=True),
+        config_path=tmp_path / "config.toml",
+        session_store_path=tmp_path / "sessions.json",
+    )
+    captured_calls: list[tuple[list[str], str | None]] = []
+
+    async def fake_run_argv(
+        command: list[str],
+        cwd: Path,
+        timeout_s: float,
+        stdin_text: str | None = None,
+    ) -> tuple[int, str, str]:
+        captured_calls.append((command, stdin_text))
+        out_file = Path(command[command.index("--output-last-message") + 1])
+        out_file.write_text("completed complex prompt", encoding="utf-8")
+        return (
+            0,
+            '{"type":"session_configured","session_id":"019ee9e9-ecb8-72e3-a495-43674e1d7576"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("codex_chatgpt_bridge.gateway.run_argv_captured", fake_run_argv)
+    monkeypatch.setattr(gateway, "_codex_path", lambda: "/usr/local/bin/codex")
+
+    tricky_prompt = (
+        'Line 1 with "double quotes" & \'single quotes\'\n'
+        "Line 2 with $env:PATH | findstr %TEMP% > out"
+    )
+    await gateway.codex_task_run(prompt=tricky_prompt, cwd=str(tmp_path))
+    await gateway.codex_session_start(prompt=tricky_prompt, cwd=str(tmp_path))
+
+    assert len(captured_calls) == 2
+    for cmd, stdin_payload in captured_calls:
+        assert cmd[-1] == "-"
+        assert stdin_payload == tricky_prompt
+
+
+@pytest.mark.asyncio
+async def test_exec_command_powershell_preserves_multiline_quotes_and_metachars(
+    tmp_path: Path,
+) -> None:
+    if not (shutil.which("pwsh") or shutil.which("powershell")):
+        pytest.skip("PowerShell binary not available")
+    gateway = LocalGateway(BridgeConfig(trust_mode="full_delegate"))
+    script = "\n".join(
+        [
+            '$txt = \'single & | > "nested" %PCT%\'',
+            "Write-Output $txt",
+            'Write-Output ("line2=" + (21 + 21))',
+        ]
+    )
+    res = await gateway.exec_command(command=script, shell="powershell", cwd=str(tmp_path))
+    assert res["returncode"] == 0
+    assert 'single & | > "nested" %PCT%' in res["stdout"]
+    assert "line2=42" in res["stdout"]
+

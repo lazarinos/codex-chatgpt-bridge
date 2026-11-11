@@ -43,6 +43,8 @@ def main() -> None:
         _cmd_set_mode(args)
     elif args.command == "set-tool-profile":
         _cmd_set_tool_profile(args)
+    elif args.command == "set-channel":
+        _cmd_set_channel(args)
     elif args.command in {"enable-tasks", "enable-codex-tasks"}:
         _cmd_set_codex_tasks(args, enabled=True)
     elif args.command in {"disable-tasks", "disable-codex-tasks"}:
@@ -89,6 +91,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Set full or delegate tool profile for AI agents",
     )
     profile.add_argument("profile", choices=["full", "delegate"])
+
+    channel = subparsers.add_parser(
+        "set-channel",
+        help="Switch cleanly between pure direct execution and optional Codex delegation",
+    )
+    channel.add_argument("channel", choices=["pure", "delegate", "codex"])
 
     subparsers.add_parser("enable-tasks", help="Enable execution task tools")
     subparsers.add_parser("enable-codex-tasks", help="Compatibility alias for enable-tasks")
@@ -260,11 +268,17 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 def _cmd_doctor(args: argparse.Namespace) -> None:
     config = load_config(args.config)
+    channel_mode = (
+        "pure_direct (0 intermediate LLM)"
+        if not config.enable_codex_tasks
+        else "codex_enabled"
+    )
     print(f"Config: {args.config}")
     print(f"Host: {config.host}")
     print(f"Port: {config.port}")
     print(f"Trust mode: {config.trust_mode}")
     print(f"Tool profile: {config.tool_profile}")
+    print(f"Channel: {channel_mode}")
     print(f"Auth token: {'configured' if config.auth_token else 'missing'}")
     print(f"Codex tasks: {'enabled' if config.enable_codex_tasks else 'disabled'}")
     print(f"Grants: {len(config.grants)}")
@@ -294,12 +308,49 @@ def _cmd_set_tool_profile(args: argparse.Namespace) -> None:
     save_config(config.model_copy(update={"tool_profile": profile}), args.config)
     print(f"Set tool profile: {profile}")
     if profile == "delegate":
-        print("delegate exposes one primary delegation tool plus read-only status tools.")
+        print(
+            "delegate exposes a compact core toolset for status, inbox chat, "
+            "direct commands, and processes."
+        )
+
+
+def _cmd_set_channel(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    choice = str(args.channel)
+    if choice == "pure":
+        updates = {
+            "trust_mode": "full_delegate",
+            "tool_profile": "full",
+            "enable_tasks": False,
+            "enable_codex_tasks": False,
+        }
+    elif choice == "delegate":
+        updates = {
+            "trust_mode": "full_delegate",
+            "tool_profile": "delegate",
+            "enable_tasks": False,
+            "enable_codex_tasks": False,
+        }
+    else:
+        updates = {
+            "trust_mode": "full_delegate",
+            "tool_profile": "full",
+            "enable_tasks": True,
+            "enable_codex_tasks": True,
+        }
+    save_config(config.model_copy(update=updates), args.config)
+    print(
+        f"Set bridge channel: {choice} "
+        f"(profile={updates['tool_profile']}, tasks={updates['enable_codex_tasks']})"
+    )
 
 
 def _cmd_set_codex_tasks(args: argparse.Namespace, *, enabled: bool) -> None:
     config = load_config(args.config)
-    save_config(config.model_copy(update={"enable_codex_tasks": enabled}), args.config)
+    save_config(
+        config.model_copy(update={"enable_tasks": enabled, "enable_codex_tasks": enabled}),
+        args.config,
+    )
     if enabled:
         print("Enabled delegation tools.")
     else:
