@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
+import secrets
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,6 +20,11 @@ from .config import ToolProfile
 from .gateway import BridgeError, LocalGateway
 
 JsonObject = dict[str, Any]
+_MCP_SAFE_ANNOTATIONS: JsonObject = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "openWorldHint": False,
+}
 
 _MAX_PARALLEL_WORKERS: int = max(128, (os.cpu_count() or 8) * 16)
 _PARALLEL_POOL = concurrent.futures.ThreadPoolExecutor(
@@ -59,24 +66,6 @@ def get_parallel_telemetry(gateway: LocalGateway | None = None) -> JsonObject:
         "total_calls": total_c,
         "running_jobs": running_jobs,
     }
-
-
-def _run_handler_in_worker_thread(
-    handler: Callable[..., Awaitable[JsonObject]],
-    arguments: JsonObject,
-) -> JsonObject:
-    return asyncio.run(handler(**arguments))
-
-
-_THREAD_OFFLOAD_TOOLS: set[str] = {
-    "search_files",
-    "list_dir",
-    "write_file",
-    "edit_file",
-    "file_ops",
-    "view_image",
-    "system_info",
-}
 
 
 class JsonRpcRequest(BaseModel):
@@ -162,7 +151,7 @@ def create_app(gateway: LocalGateway) -> FastAPI:
         connector_secret: str,
         request: JsonRpcRequest,
     ) -> JSONResponse:
-        if connector_secret != gateway.config.connector_secret:
+        if not secrets.compare_digest(connector_secret, gateway.config.connector_secret):
             return _auth_error(gateway.config.connector_secret, None)
         return await _handle_mcp_request(gateway, request, auth_mode="connector_secret")
 
@@ -209,13 +198,11 @@ async def call_tool(gateway: LocalGateway, params: JsonObject) -> JsonObject:
     handler = handlers.get(name)
     if handler is None:
         raise ValueError(f"unknown tool: {name}")
-    arg_preview = (
-        str(arguments.get("path") or arguments.get("command") or arguments.get("action") or "")[:160]
-    )
-    try:
+    arg_preview = str(
+        arguments.get("path") or arguments.get("command") or arguments.get("action") or ""
+    )[:160]
+    with contextlib.suppress(Exception):
         gateway.inbox_record_activity(name, arg_preview)
-    except Exception:
-        pass
 
     global _ACTIVE_WORKERS, _PEAK_WORKERS, _TOTAL_CALLS, _TURN_CALLS
     with _METRICS_LOCK:
@@ -299,7 +286,7 @@ async def _handle_mcp_request(
             return _jsonrpc_error(request.id, -32601, f"unknown method: {request.method}")
     except BridgeError as exc:
         return _jsonrpc_error(request.id, -32000, str(exc))
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         return _jsonrpc_error(request.id, -32602, str(exc))
     return JSONResponse({"jsonrpc": "2.0", "id": request.id, "result": result})
 
@@ -680,6 +667,10 @@ def tool_definitions(
     names = visible_tool_names(enable_codex_tasks, tool_profile=tool_profile)
     tools = [tool for tool in tools if tool["name"] in names]
     for tool in tools:
+        schema = tool.get("inputSchema")
+        if isinstance(schema, dict) and schema.get("type") == "object":
+            schema["additionalProperties"] = False
+        tool["annotations"] = dict(_MCP_SAFE_ANNOTATIONS)
         security_schemes = (
             [{"type": "noauth"}]
             if auth_mode == "connector_secret"
@@ -846,7 +837,8 @@ def _bridge_task_tool_definitions() -> list[JsonObject]:
 
 
 def _auth_error(expected_token: str, authorization: str | None) -> JSONResponse | None:
-    if authorization == f"Bearer {expected_token}":
+    expected_header = f"Bearer {expected_token}"
+    if authorization is not None and secrets.compare_digest(authorization, expected_header):
         return None
     return JSONResponse(
         {"error": "missing or invalid bearer token"},

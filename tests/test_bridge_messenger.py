@@ -223,3 +223,77 @@ def test_feed_event_view_modes_and_reflow_widths() -> None:
             assert AnsiTextMetrics.visible_width(line) <= w
         for line in ev_tool.render(width=w).splitlines():
             assert AnsiTextMetrics.visible_width(line) <= w
+
+
+def test_poll_worker_exponential_backoff_and_silent_recovery() -> None:
+    from bridge_messenger import BridgeClient
+
+    class FlakyClient(BridgeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def get_state(self, limit: int = 50) -> dict:
+            del limit
+            self.calls += 1
+            if self.calls <= 3:
+                self.last_online = False
+                raise ConnectionRefusedError("bridge restarting")
+            if self.calls == 4:
+                self.last_online = False
+                return {
+                    "unread_user_messages": 0,
+                    "action_log": [],
+                    "messages": [],
+                    "agent_telemetry": {},
+                }
+            self.last_online = True
+            return {
+                "unread_user_messages": 0,
+                "action_log": [],
+                "messages": [],
+                "agent_telemetry": {"last_tool": "bridge_status"},
+            }
+
+    client = FlakyClient()
+    ctrl = MessengerController(client=client)
+    delays: list[float] = []
+
+    def fake_wait(timeout: float) -> bool:
+        delays.append(timeout)
+        if len(delays) >= 5:
+            ctrl.stop_event.set()
+            return True
+        return False
+
+    ctrl.stop_event.wait = fake_wait  # type: ignore[method-assign]
+    ctrl.poll_worker()
+
+    assert delays == [1.0, 2.0, 4.0, 4.0, 0.6]
+    assert ctrl.server_online is True
+    assert ctrl.poll_failures == 0
+    assert ctrl.feed_events == []
+
+
+def test_status_and_jobs_boxes_handle_client_failure_resiliently() -> None:
+    from bridge_messenger import BridgeClient
+
+    class OfflineClient(BridgeClient):
+        def get_state(self, limit: int = 50) -> dict:
+            del limit
+            self.last_online = False
+            raise ConnectionRefusedError("offline")
+
+    ctrl = MessengerController(client=OfflineClient())
+    ctrl.server_online = False
+    ctrl.poll_failures = 2
+
+    status_box = AnsiTextMetrics.strip_ansi(ctrl._build_status_box())
+    jobs_box = AnsiTextMetrics.strip_ansi(ctrl._build_jobs_box())
+    header_plain = AnsiTextMetrics.strip_ansi(
+        "\n".join(ctrl.editor.build_input_box_lines(width=120))
+    )
+
+    assert "RECONNECTING" in status_box
+    assert "Active Jobs" in jobs_box
+    assert "RECONNECTING" in header_plain

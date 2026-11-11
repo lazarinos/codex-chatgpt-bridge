@@ -31,7 +31,15 @@
    - **Background Jobs Asíncronos:** 4 jobs en background lanzados simultáneamente y monitoreados en tiempo real por `process_manager`.
    - **Consultas de Sesión Paralelas:** 20 consultas concurrentes en 0.114s.
    - **Telemetría `/healthz`:** 458 llamadas totales procesadas, escala dinámica de trabajadores paralelos (`max_workers=192`, `peak_workers=10`), 0 bloqueos, 0 memory leaks, 0 caídas.
+7. **Refuerzo de Autonomía, Concurrencia, Resiliencia y Perfil `delegate` (Etapa 10):**
+   - **MCP (`mcp.py`):** Esquemas cerrados (`additionalProperties: False`), anotaciones explícitas SSOT (`readOnlyHint: True`, `destructiveHint: False`, `openWorldHint: False`), comparación constant-time (`secrets.compare_digest`), manejo JSON-RPC `-32602` ante parámetros inesperados.
+   - **Perfil `delegate` automático (`C:\Users\LAZARINOS\bin\bridge.ps1`, `restart-bridge.ps1`):** `Start-BridgeProcess` aplica `set-tool-profile delegate` (+ `full_delegate` y `enable-tasks`), reduciendo las herramientas visibles en `/mcp` a 4 (`bridge_status`, `bridge_task_run`, `bridge_session_list`, `bridge_session_status`) y respetando cambios explícitos mediante `bridge profile [delegate|full]`. Se corrigió también `restart-bridge.ps1` para delegar al daemon con `-Action restart`.
+   - **Concurrencia Windows (`live_inbox.py`):** `LiveInboxStore._load()` envuelto en `_STORE_LOCK` (`RLock`) con reintentos (3 intentos, backoff `15 ms` y `20 ms`) frente a `[WinError 32]`/`PermissionError` sin silenciar fallos persistentes ni borrar historial.
+   - **Ciclo de vida de procesos (`process_runner.py`):** `BackgroundJobManager._jobs` protegido con `RLock`, limpieza periódica automática vía hilo daemon (`clear_finished()`), liberación segura de transport/pipes y detección de PIDs huérfanos muertos.
+   - **Resiliencia TUI (`bridge_messenger.py`):** `MessengerController.poll_worker()` con backoff exponencial `(1s, 2s, 4s)` ante caídas o reinicios y recuperación silenciosa; comandos interactivos protegidos ante errores de red/disco.
+   - **Fallback `view_image` (`gateway.py`) y aislamiento de tests (`tests/conftest.py`):** El fallback GDI sin Pillow preserva PNG pequeños en lugar de convertirlos forzadamente a JPEG y utiliza archivo temporal único limpiado en `finally`; los tests aíslan `HOME`/`USERPROFILE` para no contaminar `~/.bridge/live_inbox.json`.
 
 ## Suite de Pruebas
-- `python -m pytest tests`: **71 passed in 2.21s** (100% verde).
+- `.venv\Scripts\python.exe -m pytest tests`: **77 passed in 5.12s** (100% verde, sin Pillow)
+- `python -m pytest tests`: **77 passed in 4.97s** (100% verde, con Pillow)
 

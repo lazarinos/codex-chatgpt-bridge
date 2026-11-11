@@ -644,39 +644,62 @@ class LocalGateway:
                 if os.name == "nt":
                     with contextlib.suppress(Exception):
                         import subprocess
-                        tmp_jpg = Path(tempfile.gettempdir()) / "codex_bridge_opt.jpg"
+
+                        tmp_jpg = (
+                            Path(tempfile.gettempdir())
+                            / f"codex_bridge_opt_{uuid4().hex[:8]}.jpg"
+                        )
                         src_esc = str(resolved).replace("'", "''")
                         dst_esc = str(tmp_jpg).replace("'", "''")
-                        tw = min(max_width, 640) if max_width > 0 else 640
+                        limit_w = max_width if max_width > 0 else 0
                         ps_opt = (
                             "Add-Type -AssemblyName System.Drawing; "
                             f"$img = [System.Drawing.Image]::FromFile('{src_esc}'); "
-                            f"$w = $img.Width; $h = $img.Height; $tw = [Math]::Min($w, {tw}); "
-                            "$th = [Math]::Max(1, [int][Math]::Round($h * ($tw / [double]$w))); "
+                            "try { "
+                            "$w = $img.Width; $h = $img.Height; "
+                            f"$limitW = {limit_w}; $rawLen = {len(raw_bytes)}; "
+                            "$needsOpt = (($limitW -gt 0 -and $w -gt $limitW) "
+                            "-or ($rawLen -gt 90000)); "
+                            "if (-not $needsOpt) { Write-Output \"$w,$h,KEEP\" } "
+                            "else { "
+                            "$tw = if ($limitW -gt 0 -and $w -gt $limitW) { $limitW } else { $w }; "
+                            "$th = [Math]::Max(1, [int][Math]::Round("
+                            "$h * ($tw / [double][Math]::Max(1, $w)))); "
                             "$bmp = New-Object System.Drawing.Bitmap($tw, $th); "
                             "$g = [System.Drawing.Graphics]::FromImage($bmp); "
-                            "$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; "
+                            "try { "
+                            "$g.InterpolationMode = "
+                            "[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; "
                             "$g.DrawImage($img, 0, 0, $tw, $th); "
-                            "$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }; "
+                            "$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() "
+                            "| Where-Object { $_.MimeType -eq 'image/jpeg' }; "
                             "$ep = New-Object System.Drawing.Imaging.EncoderParameters(1); "
-                            "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]65); "
+                            "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter("
+                            "[System.Drawing.Imaging.Encoder]::Quality, [long]82); "
                             f"$bmp.Save('{dst_esc}', $enc, $ep); "
-                            "Write-Output \"$tw,$th\"; "
-                            "$g.Dispose(); $bmp.Dispose(); $img.Dispose()"
+                            "Write-Output \"$tw,$th,JPEG\"; "
+                            "} finally { $g.Dispose(); $bmp.Dispose() } "
+                            "} "
+                            "} finally { $img.Dispose() }"
                         )
-                        r = subprocess.run(
-                            ["powershell", "-NoProfile", "-Command", ps_opt],
-                            capture_output=True,
-                            text=True,
-                            timeout=8,
-                            check=False,
-                        )
-                        if r.returncode == 0 and tmp_jpg.exists():
-                            out_bytes = tmp_jpg.read_bytes()
-                            mime_type = "image/jpeg"
-                            dims = r.stdout.strip().split(",")
-                            if len(dims) == 2:
-                                width, height = int(dims[0]), int(dims[1])
+                        try:
+                            r = subprocess.run(
+                                ["powershell", "-NoProfile", "-Command", ps_opt],
+                                capture_output=True,
+                                text=True,
+                                timeout=8,
+                                check=False,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            )
+                            parts = r.stdout.strip().split(",")
+                            if r.returncode == 0 and len(parts) == 3:
+                                width, height = int(parts[0]), int(parts[1])
+                                if parts[2] == "JPEG" and tmp_jpg.exists():
+                                    out_bytes = tmp_jpg.read_bytes()
+                                    mime_type = "image/jpeg"
+                        finally:
+                            with contextlib.suppress(OSError):
+                                tmp_jpg.unlink(missing_ok=True)
 
             b64_data = base64.b64encode(out_bytes).decode("ascii")
             summary = {

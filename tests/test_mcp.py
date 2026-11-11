@@ -401,7 +401,107 @@ def test_all_tools_disable_destructive_and_open_world_hints(tmp_path: Path) -> N
     assert len(tools) >= 20
     for t in tools:
         annotations = t.get("annotations", {})
-        assert annotations.get("destructiveHint") is False, f"Tool {t['name']} has destructiveHint != False"
-        assert annotations.get("openWorldHint") is False, f"Tool {t['name']} has openWorldHint != False"
-        assert annotations.get("readOnlyHint") is True, f"Tool {t['name']} has readOnlyHint != True"
+        assert annotations.get("destructiveHint") is False, f"Tool {t['name']} has destructiveHint"
+        assert annotations.get("openWorldHint") is False, f"Tool {t['name']} has openWorldHint"
+        assert annotations.get("readOnlyHint") is True, f"Tool {t['name']} has readOnlyHint"
+        assert t["inputSchema"].get("additionalProperties") is False
+
+
+def test_delegate_profile_enforces_closed_schemas_and_safe_annotations(tmp_path: Path) -> None:
+    config = BridgeConfig(
+        auth_token="test-token",
+        grants=[BridgeGrant(path=tmp_path)],
+        enable_codex_tasks=True,
+        tool_profile="delegate",
+    )
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 200
+    tools = response.json()["result"]["tools"]
+    assert len(tools) == 4
+    for t in tools:
+        assert t["annotations"] == {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "openWorldHint": False,
+        }
+        assert t["inputSchema"].get("additionalProperties") is False
+
+
+def test_tools_call_rejects_unexpected_arguments_with_invalid_params_code(
+    tmp_path: Path,
+) -> None:
+    config = BridgeConfig(
+        auth_token="test-token",
+        grants=[BridgeGrant(path=tmp_path)],
+    )
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {"name": "bridge_status", "arguments": {"unexpected_param": 123}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == -32602
+
+
+def test_tools_call_view_image_without_pillow_preserves_small_png(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+    import builtins
+    import tempfile
+
+    orig_import = builtins.__import__
+
+    def no_pil_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "PIL" or name.startswith("PIL."):
+            raise ModuleNotFoundError("simulated missing PIL")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pil_import)
+
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    img_path = tmp_path / "small.png"
+    img_path.write_bytes(png_1x1)
+    before_tmp = set(Path(tempfile.gettempdir()).glob("codex_bridge_opt_*.jpg"))
+
+    config = BridgeConfig(auth_token="test-token", grants=[BridgeGrant(path=tmp_path)])
+    app = create_app(LocalGateway(config))
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {"name": "view_image", "arguments": {"path": str(img_path)}},
+        },
+    )
+
+    after_tmp = set(Path(tempfile.gettempdir()).glob("codex_bridge_opt_*.jpg"))
+    assert after_tmp == before_tmp
+    assert response.status_code == 200
+    res = response.json()["result"]
+    assert res["content"][1]["mimeType"] == "image/png"
+    assert res["structuredContent"]["mime_type"] == "image/png"
 

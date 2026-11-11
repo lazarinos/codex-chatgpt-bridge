@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +120,40 @@ def _taskkill_windows(pid: int) -> None:
         )
 
 
+def _is_os_pid_alive(pid: int | None) -> bool:
+    """Return False if the OS process is confirmed dead; True if running or unknown."""
+    if pid is None or pid <= 0:
+        return False
+    if os.name == "nt":
+        process_query_limited_info = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(process_query_limited_info, False, int(pid))
+            if not handle:
+                return ctypes.GetLastError() == error_access_denied
+            try:
+                exit_code = ctypes.c_uint32()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                if not ok:
+                    return True
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
 @dataclass
 class StreamBuffer:
     """Bounded character buffer for live stdout/stderr streaming."""
@@ -185,12 +222,39 @@ class BackgroundJob:
     ended_monotonic: float | None = None
     returncode: int | None = None
     notified_completion: bool = False
+    loop: asyncio.AbstractEventLoop | None = None
+    _handles_released: bool = False
 
     def refresh_state(self) -> None:
         if self.returncode is None and self.process.returncode is not None:
             self.returncode = self.process.returncode
             self.ended_monotonic = time.monotonic()
             self.finished_at = datetime.now(UTC).isoformat()
+
+    def release_handles(self) -> None:
+        """Cancel finished/dangling stream tasks and close underlying subprocess transport."""
+        if self._handles_released:
+            return
+        self._handles_released = True
+        for task in (self.stdout_task, self.stderr_task):
+            if not task.done():
+                with contextlib.suppress(Exception):
+                    task.cancel()
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.close()
+
+    def schedule_handle_cleanup(self) -> None:
+        """Safely release job handles from any thread (loop thread or cleanup thread)."""
+        if self._handles_released:
+            return
+        if self.loop is not None and not self.loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self.release_handles)
+                return
+        with contextlib.suppress(Exception):
+            self.release_handles()
 
     @property
     def is_running(self) -> bool:
@@ -228,9 +292,63 @@ class BackgroundJob:
 class BackgroundJobManager:
     """Registry and controller for background commands and non-blocking executions."""
 
-    def __init__(self, *, max_buffer_chars: int = 200_000) -> None:
+    def __init__(
+        self,
+        *,
+        max_buffer_chars: int = 200_000,
+        cleanup_interval_s: float = 30.0,
+        finished_ttl_s: float = 180.0,
+        start_cleanup_thread: bool = True,
+    ) -> None:
         self._jobs: dict[str, BackgroundJob] = {}
+        self._lock = threading.RLock()
         self._max_buffer_chars = max_buffer_chars
+        self._cleanup_interval_s = max(0.05, float(cleanup_interval_s))
+        self._finished_ttl_s = max(0.0, float(finished_ttl_s))
+        self._stop_event = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        self._finalizer: weakref.finalize | None = None
+        if start_cleanup_thread:
+            self._start_cleanup_thread()
+
+    @staticmethod
+    def _cleanup_loop(
+        manager_ref: weakref.ref[BackgroundJobManager],
+        stop_event: threading.Event,
+        interval_s: float,
+    ) -> None:
+        while not stop_event.wait(interval_s):
+            manager = manager_ref()
+            if manager is None:
+                break
+            with contextlib.suppress(Exception):
+                manager.clear_finished(max_age_s=manager._finished_ttl_s)
+            del manager
+
+    def _start_cleanup_thread(self) -> None:
+        thread = threading.Thread(
+            target=self._cleanup_loop,
+            args=(weakref.ref(self), self._stop_event, self._cleanup_interval_s),
+            name="bridge_job_cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread = thread
+        self._finalizer = weakref.finalize(self, self._stop_event.set)
+        thread.start()
+
+    def close(self) -> None:
+        """Stop the periodic background cleanup thread and release tracked finished handles."""
+        self._stop_event.set()
+        if (
+            self._cleanup_thread is not None
+            and self._cleanup_thread.is_alive()
+            and threading.current_thread() is not self._cleanup_thread
+        ):
+            self._cleanup_thread.join(timeout=0.5)
+        with self._lock:
+            for job in list(self._jobs.values()):
+                if not job.is_running:
+                    job.schedule_handle_cleanup()
 
     async def start_job(
         self,
@@ -255,6 +373,7 @@ class BackgroundJobManager:
         else:
             kwargs["start_new_session"] = True
 
+        loop = asyncio.get_running_loop()
         process = await asyncio.create_subprocess_exec(*argv, **kwargs)
         stdout_buf = StreamBuffer(max_chars=self._max_buffer_chars)
         stderr_buf = StreamBuffer(max_chars=self._max_buffer_chars)
@@ -273,8 +392,10 @@ class BackgroundJobManager:
             stderr_buf=stderr_buf,
             stdout_task=stdout_task,
             stderr_task=stderr_task,
+            loop=loop,
         )
-        self._jobs[job.job_id] = job
+        with self._lock:
+            self._jobs[job.job_id] = job
         return job
 
     async def run_command(
@@ -305,7 +426,9 @@ class BackgroundJobManager:
             result["timed_out"] = False
             return result
 
-        effective_wait = min(float(timeout_s), 12.0) if auto_background_on_timeout else float(timeout_s)
+        effective_wait = (
+            min(float(timeout_s), 12.0) if auto_background_on_timeout else float(timeout_s)
+        )
         try:
             await asyncio.wait_for(job.process.wait(), timeout=effective_wait)
         except TimeoutError:
@@ -344,24 +467,29 @@ class BackgroundJobManager:
         result = job.to_dict(include_output=True, tail_chars=tail_chars)
         result["background"] = False
         result["timed_out"] = False
-        # Clean up completed foreground jobs automatically so registry stays tidy
-        self._jobs.pop(job.job_id, None)
+        # Clean up completed foreground jobs automatically so registry and handles stay tidy
+        with self._lock:
+            self._jobs.pop(job.job_id, None)
+        job.release_handles()
         return result
 
     def list_jobs(self) -> list[JsonObject]:
+        with self._lock:
+            jobs = list(self._jobs.values())
         return [
             job.to_dict(include_output=False)
             for job in sorted(
-                self._jobs.values(),
+                jobs,
                 key=lambda item: item.started_monotonic,
                 reverse=True,
             )
         ]
 
     def get_job(self, job_id: str) -> BackgroundJob:
-        if job_id == "latest" and self._jobs:
-            return max(self._jobs.values(), key=lambda item: item.started_monotonic)
-        job = self._jobs.get(job_id)
+        with self._lock:
+            if job_id == "latest" and self._jobs:
+                return max(self._jobs.values(), key=lambda item: item.started_monotonic)
+            job = self._jobs.get(job_id)
         if job is None:
             raise KeyError(f"unknown job_id: {job_id}")
         return job
@@ -373,7 +501,7 @@ class BackgroundJobManager:
         timeout_s: float = 18.0,
         tail_chars: int = 16_000,
     ) -> JsonObject:
-        """Reactive long-polling: wait up to `timeout_s` for `job_id` to finish and return immediately on exit."""
+        """Wait up to `timeout_s` for `job_id` to finish and return immediately on exit."""
         job = self.get_job(job_id)
         effective_wait = max(0.1, min(float(timeout_s), 22.0))
         if job.is_running:
@@ -389,9 +517,11 @@ class BackgroundJobManager:
         return job.to_dict(include_output=True, tail_chars=tail_chars)
 
     def pop_newly_completed_jobs(self, *, tail_chars: int = 1500) -> list[JsonObject]:
-        """Return one-shot completion alerts for any background jobs that finished since last check."""
+        """Return one-shot completion alerts for background jobs that finished since last check."""
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda item: item.started_monotonic)
         alerts: list[JsonObject] = []
-        for job in sorted(self._jobs.values(), key=lambda item: item.started_monotonic):
+        for job in jobs:
             if not job.is_running and not job.notified_completion:
                 job.notified_completion = True
                 alerts.append(
@@ -413,15 +543,13 @@ class BackgroundJobManager:
             await kill_process_tree(job.process)
             with contextlib.suppress(TimeoutError, Exception):
                 await asyncio.wait_for(job.process.wait(), timeout=2.0)
-        for task in (job.stdout_task, job.stderr_task):
-            if not task.done():
-                task.cancel()
         job.refresh_state()
         if job.returncode is None:
             job.returncode = -9
             job.ended_monotonic = time.monotonic()
             job.finished_at = datetime.now(UTC).isoformat()
         data = job.to_dict(include_output=True)
+        job.release_handles()
         data["status"] = "killed"
         return data
 
@@ -437,10 +565,41 @@ class BackgroundJobManager:
         await asyncio.sleep(0.1)
         return job.to_dict(include_output=True)
 
-    def clear_finished(self) -> int:
-        to_remove = [jid for jid, job in self._jobs.items() if not job.is_running]
-        for jid in to_remove:
-            self._jobs.pop(jid, None)
+    def clear_finished(self, *, max_age_s: float | None = None) -> int:
+        """Reap orphaned or finished jobs, releasing pipe handles and pruning stale entries."""
+        now = time.monotonic()
+        with self._lock:
+            items = list(self._jobs.items())
+
+        to_remove: list[str] = []
+        handles_to_release: list[BackgroundJob] = []
+        for jid, job in items:
+            running = job.is_running
+            if (
+                running
+                and job.pid is not None
+                and (now - job.started_monotonic >= 2.0)
+                and not _is_os_pid_alive(job.pid)
+            ):
+                job.returncode = -1
+                job.ended_monotonic = now
+                job.finished_at = datetime.now(UTC).isoformat()
+                running = False
+
+            if not running:
+                handles_to_release.append(job)
+                if job.ended_monotonic is None:
+                    job.ended_monotonic = now
+                if max_age_s is None or (now - job.ended_monotonic) >= max_age_s:
+                    to_remove.append(jid)
+
+        for job in handles_to_release:
+            job.schedule_handle_cleanup()
+
+        if to_remove:
+            with self._lock:
+                for jid in to_remove:
+                    self._jobs.pop(jid, None)
         return len(to_remove)
 
 

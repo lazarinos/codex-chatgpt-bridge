@@ -267,11 +267,12 @@ def enable_windows_ansi() -> None:
 # 2. Transport Layer: BridgeClient (Decoupled Network & Fallback)
 # -----------------------------------------------------------------------------
 class BridgeClient:
-    """Handles communication with the Codex ChatGPT Bridge HTTP daemon."""
+    """Handles communication with the Bridge HTTP daemon with offline disk fallback."""
 
     def __init__(self, base_url: str = BRIDGE_URL, fallback_path: Path = FALLBACK_INBOX) -> None:
         self.base_url = base_url
         self.fallback_path = fallback_path
+        self.last_online: bool = True
 
     def request(self, path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
@@ -280,9 +281,14 @@ class BridgeClient:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=2.5) as resp:
-                return json.loads(resp.read().decode("utf-8", errors="replace"))
+                parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+            self.last_online = True
+            return parsed
         except Exception:
-            sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+            self.last_online = False
+            src_dir = str(Path(__file__).resolve().parent / "src")
+            if src_dir not in sys.path:
+                sys.path.insert(0, src_dir)
             from codex_chatgpt_bridge.live_inbox import LiveInboxStore
 
             store = LiveInboxStore(self.fallback_path)
@@ -867,10 +873,12 @@ class TuiLineEditor:
         turn_c = int(meta.get("turn_calls", 0) or 0)
         total_c = int(meta.get("total_calls", 0) or 0)
         char_cnt = len(self.input_chars)
+        conn_part = "" if meta.get("server_online", True) else " · RECONNECTING"
 
         raw_header = (
-            f" Input [{prio}] · Calls:{turn_c}/{total_c} · W:{active_w}/{max_w} · J:{run_jobs} · "
-            f"Q:{unread} · View:{view}{filt_part} · [{spin}] {agent_part} · {char_cnt}c "
+            f" Input [{prio}] · Calls:{turn_c}/{total_c} · W:{active_w}/{max_w} · "
+            f"J:{run_jobs} · Q:{unread} · View:{view}{filt_part}{conn_part} · "
+            f"[{spin}] {agent_part} · {char_cnt}c "
         )
         clean_header = AnsiTextMetrics.truncate_plain(raw_header, max(10, w - 4))
         h_vis = AnsiTextMetrics.visible_width(clean_header)
@@ -1261,9 +1269,14 @@ class TuiLineEditor:
 class MessengerController:
     """Coordinates polling, SSOT feed storage, resize reflow, and command execution."""
 
+    _POLL_INTERVAL_S: Final[float] = 0.60
+    _POLL_BACKOFF_SCHEDULE_S: Final[tuple[float, ...]] = (1.0, 2.0, 4.0)
+
     def __init__(self, client: BridgeClient | None = None) -> None:
         self.client = client or _default_client
         self.stop_event = threading.Event()
+        self.server_online: bool = True
+        self.poll_failures: int = 0
         self.view_mode: ViewMode = "all"
         self.default_priority: PriorityLevel = "normal"
         self.filter_query: str = ""
@@ -1313,6 +1326,8 @@ class MessengerController:
             "running_jobs": self.running_jobs_count,
             "turn_calls": self.turn_calls,
             "total_calls": self.total_calls,
+            "server_online": self.server_online,
+            "poll_failures": self.poll_failures,
         }
 
     def _handle_hotkey(self, key: str) -> None:
@@ -1423,120 +1438,184 @@ class MessengerController:
             return True
         return False
 
+    @classmethod
+    def _compute_poll_delay(cls, failures: int) -> float:
+        if failures <= 0:
+            return cls._POLL_INTERVAL_S
+        idx = min(failures - 1, len(cls._POLL_BACKOFF_SCHEDULE_S) - 1)
+        return cls._POLL_BACKOFF_SCHEDULE_S[idx]
+
+    def _apply_polled_state(self, state: dict[str, Any]) -> None:
+        self.unread_count = int(state.get("unread_user_messages", 0) or 0)
+
+        # Process action log
+        for act in state.get("action_log") or []:
+            aid = act.get("id", "")
+            if aid and aid not in self.seen_action_ids:
+                self.seen_action_ids.add(aid)
+                t_name = act.get("tool", "tool")
+                t_sum = act.get("summary", "")
+                t_det = act.get("details", "")
+                if self._is_noisy_action(t_name, t_sum, t_det):
+                    continue
+                act_sig = f"{t_name}|{t_sum.strip()}|{bool(t_det)}|{t_det[:64]}"
+                if act_sig == self.last_rendered_act_sig:
+                    continue
+                self.last_rendered_act_sig = act_sig
+                t_ts = (act.get("timestamp") or "")[11:19] or time.strftime("%H:%M:%S")
+                self.consolidator.push(t_name, t_sum, t_ts, t_det)
+
+        # Check idle flush for consolidated reading actions
+        self.consolidator.check_idle_flush(idle_seconds=1.2)
+
+        # Live Agent & Parallel Worker Pool telemetry updated in the framed input box header
+        tele = state.get("agent_telemetry") or {}
+        p_eng = state.get("parallel_engine") or {}
+        self.active_workers = int(p_eng.get("active_workers", 0) or 0)
+        self.max_workers = int(p_eng.get("max_workers", 32) or 32)
+        self.running_jobs_count = int(p_eng.get("running_jobs", len(state.get("active_jobs") or [])) or 0)
+        cur_tool = tele.get("last_tool") or "idle"
+        cur_sum = tele.get("last_summary") or ""
+        cur_upd = tele.get("updated_at") or ""
+        new_sig = f"{cur_tool}|{cur_upd}"
+        if new_sig != self.last_tool_sig and cur_upd:
+            self.turn_calls += 1
+            self.total_calls += 1
+        if p_eng.get("total_calls") is not None:
+            self.turn_calls = int(p_eng.get("turn_calls", self.turn_calls) or 0)
+            self.total_calls = max(self.total_calls, int(p_eng.get("total_calls", 0) or 0))
+        self.active_agent_tool = TuiRenderer.TOOL_LABELS.get(cur_tool, cur_tool)
+        self.active_agent_summary = Path(cur_sum).name if ("\\" in cur_sum or "/" in cur_sum) else cur_sum[:28]
+        self.last_tool_sig = new_sig
+
+        # Process messages
+        for m in state.get("messages") or []:
+            mid = m.get("id", "")
+            sender = m.get("sender", "user")
+            txt = m.get("text", "")
+            ts = (m.get("created_at") or "")[11:19]
+            if mid not in self.seen_ids:
+                self.seen_ids.add(mid)
+                msg_sig = f"{sender}|{txt.strip()}"
+                if msg_sig == self.last_rendered_msg_sig:
+                    continue
+                self.last_rendered_msg_sig = msg_sig
+                self.consolidator.flush()
+
+                if sender == "agent":
+                    def _beep_agent() -> None:
+                        try:
+                            import winsound
+                            winsound.Beep(880, 110)
+                            winsound.Beep(1175, 140)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_beep_agent, daemon=True).start()
+                    self.record_and_print_event(FeedEvent(kind="agent", timestamp=ts, text=txt))
+                else:
+                    if m.get("read_by_agent"):
+                        self.delivered_ids.add(mid)
+                    self.record_and_print_event(
+                        FeedEvent(
+                            kind="user",
+                            timestamp=ts,
+                            text=txt,
+                            delivered_tool=(m.get("delivered_in_tool") or "tool") if m.get("read_by_agent") else None,
+                            priority=m.get("priority", "normal"),
+                        )
+                    )
+            elif sender == "user" and m.get("read_by_agent") and mid not in self.delivered_ids:
+                self.delivered_ids.add(mid)
+                tool_d = m.get("delivered_in_tool") or "tool"
+                # Update existing user event in feed_events for future reflows
+                for ev in reversed(self.feed_events):
+                    if ev.kind == "user" and ev.text == txt and ev.delivered_tool is None:
+                        ev.delivered_tool = tool_d
+                        break
+                ack_line = (
+                    f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}"
+                    f"[delivered to agent in {tool_d} · {ts}: \"{AnsiTextMetrics.truncate_plain(txt, 54)}\"]{Theme.RESET}"
+                )
+                self._emit_system_box(ack_line)
+
     def poll_worker(self) -> None:
         while not self.stop_event.is_set():
             try:
                 state = self.client.get_state()
-                self.unread_count = int(state.get("unread_user_messages", 0) or 0)
-
-                # Process action log
-                for act in state.get("action_log") or []:
-                    aid = act.get("id", "")
-                    if aid and aid not in self.seen_action_ids:
-                        self.seen_action_ids.add(aid)
-                        t_name = act.get("tool", "tool")
-                        t_sum = act.get("summary", "")
-                        t_det = act.get("details", "")
-                        if self._is_noisy_action(t_name, t_sum, t_det):
-                            continue
-                        act_sig = f"{t_name}|{t_sum.strip()}|{bool(t_det)}|{t_det[:64]}"
-                        if act_sig == self.last_rendered_act_sig:
-                            continue
-                        self.last_rendered_act_sig = act_sig
-                        t_ts = (act.get("timestamp") or "")[11:19] or time.strftime("%H:%M:%S")
-                        self.consolidator.push(t_name, t_sum, t_ts, t_det)
-
-                # Check idle flush for consolidated reading actions
-                self.consolidator.check_idle_flush(idle_seconds=1.2)
-
-                # Live Agent & Parallel Worker Pool telemetry updated in the framed input box header
-                tele = state.get("agent_telemetry") or {}
-                p_eng = state.get("parallel_engine") or {}
-                self.active_workers = int(p_eng.get("active_workers", 0) or 0)
-                self.max_workers = int(p_eng.get("max_workers", 32) or 32)
-                self.running_jobs_count = int(p_eng.get("running_jobs", len(state.get("active_jobs") or [])) or 0)
-                cur_tool = tele.get("last_tool") or "idle"
-                cur_sum = tele.get("last_summary") or ""
-                cur_upd = tele.get("updated_at") or ""
-                new_sig = f"{cur_tool}|{cur_upd}"
-                if new_sig != self.last_tool_sig and cur_upd:
-                    self.turn_calls += 1
-                    self.total_calls += 1
-                if p_eng.get("total_calls") is not None:
-                    self.turn_calls = int(p_eng.get("turn_calls", self.turn_calls) or 0)
-                    self.total_calls = max(self.total_calls, int(p_eng.get("total_calls", 0) or 0))
-                self.active_agent_tool = TuiRenderer.TOOL_LABELS.get(cur_tool, cur_tool)
-                self.active_agent_summary = Path(cur_sum).name if ("\\" in cur_sum or "/" in cur_sum) else cur_sum[:28]
-                self.last_tool_sig = new_sig
-
-                # Process messages
-                for m in state.get("messages") or []:
-                    mid = m.get("id", "")
-                    sender = m.get("sender", "user")
-                    txt = m.get("text", "")
-                    ts = (m.get("created_at") or "")[11:19]
-                    if mid not in self.seen_ids:
-                        self.seen_ids.add(mid)
-                        msg_sig = f"{sender}|{txt.strip()}"
-                        if msg_sig == self.last_rendered_msg_sig:
-                            continue
-                        self.last_rendered_msg_sig = msg_sig
-                        self.consolidator.flush()
-
-                        if sender == "agent":
-                            def _beep_agent() -> None:
-                                try:
-                                    import winsound
-                                    winsound.Beep(880, 110)
-                                    winsound.Beep(1175, 140)
-                                except Exception:
-                                    pass
-                            threading.Thread(target=_beep_agent, daemon=True).start()
-                            self.record_and_print_event(FeedEvent(kind="agent", timestamp=ts, text=txt))
-                        else:
-                            if m.get("read_by_agent"):
-                                self.delivered_ids.add(mid)
-                            self.record_and_print_event(
-                                FeedEvent(
-                                    kind="user",
-                                    timestamp=ts,
-                                    text=txt,
-                                    delivered_tool=(m.get("delivered_in_tool") or "tool") if m.get("read_by_agent") else None,
-                                    priority=m.get("priority", "normal"),
-                                )
-                            )
-                    elif sender == "user" and m.get("read_by_agent") and mid not in self.delivered_ids:
-                        self.delivered_ids.add(mid)
-                        tool_d = m.get("delivered_in_tool") or "tool"
-                        # Update existing user event in feed_events for future reflows
-                        for ev in reversed(self.feed_events):
-                            if ev.kind == "user" and ev.text == txt and ev.delivered_tool is None:
-                                ev.delivered_tool = tool_d
-                                break
-                        ack_line = (
-                            f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}"
-                            f"[delivered to agent in {tool_d} · {ts}: \"{AnsiTextMetrics.truncate_plain(txt, 54)}\"]{Theme.RESET}"
-                        )
-                        self._emit_system_box(ack_line)
+                client_online = bool(getattr(self.client, "last_online", True))
+                self._apply_polled_state(state)
+                if client_online:
+                    self.poll_failures = 0
+                    self.server_online = True
+                else:
+                    self.poll_failures += 1
+                    self.server_online = False
             except Exception:
-                pass
-            self.stop_event.wait(0.60)
+                self.poll_failures += 1
+                self.server_online = False
+            wait_s = self._compute_poll_delay(self.poll_failures)
+            self.stop_event.wait(wait_s)
+
+    def _get_state_resilient(self, limit: int = 50) -> dict[str, Any] | None:
+        try:
+            state = self.client.get_state(limit=limit)
+            if not getattr(self.client, "last_online", True):
+                self.server_online = False
+            return state
+        except Exception as exc:
+            self.server_online = False
+            self.poll_failures += 1
+            self._emit_system_box(
+                f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.WARN}"
+                f"[bridge offline/reconnecting: {exc}]{Theme.RESET}"
+            )
+            return None
 
     def _build_jobs_box(self) -> str:
-        st = self.client.get_state()
-        p_eng = st.get("parallel_engine") or {}
+        try:
+            st = self.client.get_state()
+        except Exception:
+            st = {}
         act_jobs = st.get("active_jobs") or []
         rows = [
-            (f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.TEXT}Turn: {self.turn_calls} · Session Total: {self.total_calls}{Theme.RESET}", -1),
-            (f"{Theme.TOOL}Worker Pool:{Theme.RESET} {Theme.TEXT}{self.active_workers}/{self.max_workers} active threads{Theme.RESET}", -1),
-            (f"{Theme.TOOL}Active Jobs:{Theme.RESET} {Theme.TEXT}{len(act_jobs)} running{Theme.RESET}", -1),
+            (
+                f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.TEXT}"
+                f"Turn: {self.turn_calls} · Session Total: {self.total_calls}{Theme.RESET}",
+                -1,
+            ),
+            (
+                f"{Theme.TOOL}Worker Pool:{Theme.RESET} {Theme.TEXT}"
+                f"{self.active_workers}/{self.max_workers} active threads{Theme.RESET}",
+                -1,
+            ),
+            (
+                f"{Theme.TOOL}Active Jobs:{Theme.RESET} {Theme.TEXT}"
+                f"{len(act_jobs)} running{Theme.RESET}",
+                -1,
+            ),
         ]
         for j in act_jobs[:8]:
-            rows.append((f"  {Theme.WARN}* [{j.get('job_id')}] PID {j.get('pid')} ({j.get('elapsed_s')}s): {j.get('command')}{Theme.RESET}", -1))
-        return TuiRenderer.render_box(rows, border_color=Theme.TOOL, title="Parallel Engine & Call Telemetry (F3)")
+            rows.append(
+                (
+                    f"  {Theme.WARN}* [{j.get('job_id')}] PID {j.get('pid')} "
+                    f"({j.get('elapsed_s')}s): {j.get('command')}{Theme.RESET}",
+                    -1,
+                )
+            )
+        return TuiRenderer.render_box(
+            rows,
+            border_color=Theme.TOOL,
+            title="Parallel Engine & Call Telemetry (F3)",
+        )
 
     def _build_status_box(self) -> str:
-        st = self.client.get_state()
+        try:
+            st = self.client.get_state()
+            client_online = bool(getattr(self.client, "last_online", True))
+        except Exception:
+            st = {}
+            client_online = False
+        is_online = self.server_online and client_online
         t = st.get("agent_telemetry") or {}
         unread_cnt = st.get("unread_user_messages", 0)
         tot_msgs = st.get("total_messages", 0)
@@ -1545,12 +1624,36 @@ class MessengerController:
         last_s = AnsiTextMetrics.truncate_plain(t.get("last_summary", "") or "", 48)
         upd_t = (t.get("updated_at") or "")[11:19] or "recent"
         cols, rows = Theme.term_size()
+        gateway_line = (
+            f"{Theme.SUCCESS}[STATUS]{Theme.RESET} {Theme.TEXT}"
+            f"HTTP Gateway active (127.0.0.1:8766){Theme.RESET}"
+            if is_online
+            else f"{Theme.WARN}[RECONNECTING]{Theme.RESET} {Theme.TEXT}"
+            f"Offline fallback (retry backoff #{self.poll_failures}){Theme.RESET}"
+        )
         status_rows = [
-            (f"{Theme.SUCCESS}[STATUS]{Theme.RESET} {Theme.TEXT}HTTP Gateway active (127.0.0.1:8766){Theme.RESET}", -1),
-            (f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.SUCCESS}Turn: {self.turn_calls}{Theme.RESET} · {Theme.TEXT}Total: {self.total_calls} · Actions logged: {tot_acts}{Theme.RESET}", -1),
-            (f"{Theme.TOOL}Viewport:{Theme.RESET} {Theme.TEXT}{cols}x{rows} cols/rows · Mode: {self.view_mode.upper()} · Prio: {self.default_priority.upper()}{Theme.RESET}", -1),
-            (f"{Theme.TOOL}Unread queue:{Theme.RESET} {Theme.WARN}{unread_cnt} pending{Theme.RESET} · {Theme.TEXT}{tot_msgs} msgs{Theme.RESET}", -1),
-            (f"{Theme.ACCENT}Last tool:{Theme.RESET} {Theme.TEXT}{last_t}{Theme.RESET} {Theme.MUTED}({last_s}) · {upd_t}{Theme.RESET}", -1),
+            (gateway_line, -1),
+            (
+                f"{Theme.TOOL}Tool Calls:{Theme.RESET} {Theme.SUCCESS}"
+                f"Turn: {self.turn_calls}{Theme.RESET} · {Theme.TEXT}"
+                f"Total: {self.total_calls} · Actions logged: {tot_acts}{Theme.RESET}",
+                -1,
+            ),
+            (
+                f"{Theme.TOOL}Viewport:{Theme.RESET} {Theme.TEXT}{cols}x{rows} cols/rows · "
+                f"Mode: {self.view_mode.upper()} · Prio: {self.default_priority.upper()}{Theme.RESET}",
+                -1,
+            ),
+            (
+                f"{Theme.TOOL}Unread queue:{Theme.RESET} {Theme.WARN}"
+                f"{unread_cnt} pending{Theme.RESET} · {Theme.TEXT}{tot_msgs} msgs{Theme.RESET}",
+                -1,
+            ),
+            (
+                f"{Theme.ACCENT}Last tool:{Theme.RESET} {Theme.TEXT}{last_t}{Theme.RESET} "
+                f"{Theme.MUTED}({last_s}) · {upd_t}{Theme.RESET}",
+                -1,
+            ),
         ]
         return TuiRenderer.render_box(status_rows, border_color=Theme.TOOL, title="Bridge Status (F4)")
 
@@ -1584,7 +1687,18 @@ class MessengerController:
 
         # Seed initial state: mark all pre-existing actions and messages as seen
         # so historical messages NEVER trigger sound alerts or fake "new message" prints
-        init_state = self.client.get_state()
+        try:
+            init_state = self.client.get_state()
+            if getattr(self.client, "last_online", True):
+                self.server_online = True
+                self.poll_failures = 0
+            else:
+                self.server_online = False
+                self.poll_failures = 1
+        except Exception:
+            init_state = {}
+            self.server_online = False
+            self.poll_failures = 1
         self.unread_count = int(init_state.get("unread_user_messages", 0) or 0)
         for act in init_state.get("action_log") or []:
             if act.get("id"):
@@ -1650,13 +1764,22 @@ class MessengerController:
                     break
 
                 if low in {"/limpiar", "/clear"}:
-                    res = self.client.clear_inbox()
+                    try:
+                        res = self.client.clear_inbox()
+                    except Exception as exc:
+                        self._emit_system_box(
+                            f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.ERROR}"
+                            f"[failed to clear inbox: {exc}]{Theme.RESET}"
+                        )
+                        continue
                     self.seen_ids.clear()
                     self.delivered_ids.clear()
                     self.feed_events = [FeedEvent(kind="banner")]
                     self.reflow_screen()
                     self._emit_system_box(
-                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}[ok · screen and history cleared ({res.get('cleared', 0)} messages)]{Theme.RESET}"
+                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}"
+                        f"[ok · screen and history cleared ({res.get('cleared', 0)} messages)]"
+                        f"{Theme.RESET}"
                     )
                     continue
 
@@ -1716,7 +1839,9 @@ class MessengerController:
                 if low.startswith("/search ") or low.startswith("/buscar "):
                     query = txt.split(None, 1)[1].strip()
                     q_low = query.lower()
-                    st = self.client.get_state(limit=100)
+                    st = self._get_state_resilient(limit=100)
+                    if st is None:
+                        continue
                     matches_rows: list[tuple[str, int]] = []
                     for m in st.get("messages") or []:
                         m_txt = m.get("text", "")
@@ -1724,7 +1849,13 @@ class MessengerController:
                             mts = (m.get("created_at") or "")[11:19]
                             who = "Agent" if m.get("sender") == "agent" else "You"
                             snippet = AnsiTextMetrics.truncate_plain(m_txt.replace("\n", " "), 62)
-                            matches_rows.append((f"{Theme.ACCENT}[{who} · {mts}]{Theme.RESET} {Theme.TEXT}{snippet}{Theme.RESET}", -1))
+                            matches_rows.append(
+                                (
+                                    f"{Theme.ACCENT}[{who} · {mts}]{Theme.RESET} "
+                                    f"{Theme.TEXT}{snippet}{Theme.RESET}",
+                                    -1,
+                                )
+                            )
                     for a in st.get("action_log") or []:
                         a_sum = a.get("summary", "")
                         a_det = a.get("details", "")
@@ -1732,18 +1863,36 @@ class MessengerController:
                             ats = (a.get("timestamp") or "")[11:19]
                             lbl = TuiRenderer.TOOL_LABELS.get(a.get("tool", ""), a.get("tool", ""))
                             snippet = AnsiTextMetrics.truncate_plain(a_sum, 56)
-                            matches_rows.append((f"{Theme.TOOL}[{lbl} · {ats}]{Theme.RESET} {Theme.MUTED}{snippet}{Theme.RESET}", -1))
+                            matches_rows.append(
+                                (
+                                    f"{Theme.TOOL}[{lbl} · {ats}]{Theme.RESET} "
+                                    f"{Theme.MUTED}{snippet}{Theme.RESET}",
+                                    -1,
+                                )
+                            )
                     if not matches_rows:
-                        matches_rows.append((f"{Theme.MUTED}No matches found for \"{query}\".{Theme.RESET}", -1))
+                        matches_rows.append(
+                            (f"{Theme.MUTED}No matches found for \"{query}\".{Theme.RESET}", -1)
+                        )
                     self._emit_system_box(
-                        TuiRenderer.render_box(matches_rows[-18:], border_color=Theme.INFO, title=f"Search Results: {query}")
+                        TuiRenderer.render_box(
+                            matches_rows[-18:],
+                            border_color=Theme.INFO,
+                            title=f"Search Results: {query}",
+                        )
                     )
                     continue
 
                 if low.startswith("/export"):
                     parts = txt.split(None, 1)
-                    out_path = Path(parts[1].strip()) if len(parts) > 1 else Path("bridge_session_export.md")
-                    st = self.client.get_state(limit=200)
+                    out_path = (
+                        Path(parts[1].strip())
+                        if len(parts) > 1
+                        else Path("bridge_session_export.md")
+                    )
+                    st = self._get_state_resilient(limit=200)
+                    if st is None:
+                        continue
                     md_lines = [
                         "# Bridge — Session Export",
                         f"- **Exported at**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`",
@@ -1752,82 +1901,98 @@ class MessengerController:
                     ]
                     for m in st.get("messages") or []:
                         mts = (m.get("created_at") or "")[:19]
-                        who = "Agent" if m.get("sender") == "agent" else f"User ({m.get('priority', 'normal')})"
+                        who = (
+                            "Agent"
+                            if m.get("sender") == "agent"
+                            else f"User ({m.get('priority', 'normal')})"
+                        )
                         md_lines.append(f"### [{mts}] {who}\n\n{m.get('text', '')}\n")
                     md_lines.append("## Recent Tool Actions\n")
                     for a in st.get("action_log") or []:
                         ats = (a.get("timestamp") or "")[:19]
-                        md_lines.append(f"- `{ats}` **{a.get('tool', '')}**: `{a.get('summary', '')}`")
-                    out_path.write_text("\n".join(md_lines), encoding="utf-8")
+                        md_lines.append(
+                            f"- `{ats}` **{a.get('tool', '')}**: `{a.get('summary', '')}`"
+                        )
+                    try:
+                        out_path.write_text("\n".join(md_lines), encoding="utf-8")
+                    except OSError as exc:
+                        self._emit_system_box(
+                            f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.ERROR}"
+                            f"[failed to export session: {exc}]{Theme.RESET}"
+                        )
+                        continue
                     self._emit_system_box(
-                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}[ok · session exported to {out_path.resolve()}]{Theme.RESET}"
+                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.SUCCESS}"
+                        f"[ok · session exported to {out_path.resolve()}]{Theme.RESET}"
                     )
                     continue
 
                 if low in {"/estado", "/status", "/stats"}:
-                    st = self.client.get_state()
-                    t = st.get("agent_telemetry") or {}
-                    unread_cnt = st.get("unread_user_messages", 0)
-                    tot_msgs = st.get("total_messages", 0)
-                    tot_acts = len(st.get("action_log") or [])
-                    last_t = t.get("last_tool", "idle")
-                    last_s = AnsiTextMetrics.truncate_plain(t.get("last_summary", "") or "", 48)
-                    upd_t = (t.get("updated_at") or "")[11:19] or "recent"
-                    cols, rows = Theme.term_size()
-
-                    status_rows = [
-                        (f"{Theme.SUCCESS}[STATUS]{Theme.RESET} {Theme.TEXT}HTTP Gateway active (127.0.0.1:8766){Theme.RESET}", -1),
-                        (f"{Theme.TOOL}Viewport:{Theme.RESET} {Theme.TEXT}{cols}x{rows} cols/rows · Mode: {self.view_mode.upper()} · Prio: {self.default_priority.upper()}{Theme.RESET}", -1),
-                        (f"{Theme.TOOL}Unread queue:{Theme.RESET} {Theme.WARN}{unread_cnt} pending{Theme.RESET} · {Theme.TEXT}{tot_msgs} msgs · {tot_acts} actions{Theme.RESET}", -1),
-                        (f"{Theme.ACCENT}Last tool:{Theme.RESET} {Theme.TEXT}{last_t}{Theme.RESET} {Theme.MUTED}({last_s}){Theme.RESET}", -1),
-                        (f"{Theme.MUTED}Updated at: {upd_t}{Theme.RESET}", -1),
-                    ]
-                    self._emit_system_box(TuiRenderer.render_box(status_rows, border_color=Theme.TOOL, title="Bridge Status"))
+                    self._emit_system_box(self._build_status_box())
                     continue
 
                 if low in {"/acciones", "/actions", "/log"}:
-                    st = self.client.get_state()
+                    st = self._get_state_resilient()
+                    if st is None:
+                        continue
                     acts = st.get("action_log") or []
-                    lines_out = [f"  {Theme.MUTED}{Theme.CONNECTOR} Recent agent tool actions ({min(15, len(acts))}):{Theme.RESET}"]
+                    lines_out = [
+                        f"  {Theme.MUTED}{Theme.CONNECTOR} "
+                        f"Recent agent tool actions ({min(15, len(acts))}):{Theme.RESET}"
+                    ]
                     for a in acts[-15:]:
                         ats = (a.get("timestamp") or "")[11:19]
                         lbl = TuiRenderer.TOOL_LABELS.get(a.get("tool", ""), a.get("tool", ""))
                         det = (a.get("details") or "").splitlines()
-                        det_head = f" {Theme.ACCENT}[{AnsiTextMetrics.truncate_plain(det[0], 36)}]{Theme.RESET}" if det else ""
+                        det_head = (
+                            f" {Theme.ACCENT}[{AnsiTextMetrics.truncate_plain(det[0], 36)}]"
+                            f"{Theme.RESET}"
+                            if det
+                            else ""
+                        )
                         sum_trunc = AnsiTextMetrics.truncate_plain(a.get("summary", ""), 48)
-                        lines_out.append(f"     {Theme.TOOL}{Theme.BULLET} {lbl}{Theme.RESET}({sum_trunc}){det_head} {Theme.MUTED}· {ats}{Theme.RESET}")
+                        lines_out.append(
+                            f"     {Theme.TOOL}{Theme.BULLET} {lbl}{Theme.RESET}"
+                            f"({sum_trunc}){det_head} {Theme.MUTED}· {ats}{Theme.RESET}"
+                        )
                     self._emit_system_box("\n".join(lines_out))
                     continue
 
                 if low in {"/diff", "/diffs", "/edits", "/cambios"}:
-                    st = self.client.get_state()
+                    st = self._get_state_resilient()
+                    if st is None:
+                        continue
                     acts = [
-                        a for a in (st.get("action_log") or [])
-                        if a.get("details") and a.get("tool") in {"edit_file", "write_file", "exec_command"}
+                        a
+                        for a in (st.get("action_log") or [])
+                        if a.get("details")
+                        and a.get("tool") in {"edit_file", "write_file", "exec_command"}
                     ]
                     if not acts:
                         self._emit_system_box(
-                            f"  {Theme.MUTED}{Theme.CONNECTOR} No recent file diffs or command outputs recorded yet.{Theme.RESET}"
+                            f"  {Theme.MUTED}{Theme.CONNECTOR} "
+                            f"No recent file diffs or command outputs recorded yet.{Theme.RESET}"
                         )
                     else:
-                        blocks = [f"  {Theme.MUTED}{Theme.CONNECTOR} Recent diffs & command executions ({min(6, len(acts))}):{Theme.RESET}"]
+                        blocks = [
+                            f"  {Theme.MUTED}{Theme.CONNECTOR} "
+                            f"Recent diffs & command executions ({min(6, len(acts))}):{Theme.RESET}"
+                        ]
                         for a in acts[-6:]:
                             ats = (a.get("timestamp") or "")[11:19]
-                            blocks.append(TuiRenderer.format_tool_call(a.get("tool", "tool"), a.get("summary", ""), ats, a.get("details", "")))
+                            blocks.append(
+                                TuiRenderer.format_tool_call(
+                                    a.get("tool", "tool"),
+                                    a.get("summary", ""),
+                                    ats,
+                                    a.get("details", ""),
+                                )
+                            )
                         self._emit_system_box("\n\n".join(blocks))
                     continue
 
                 if low in {"/jobs", "/procesos"}:
-                    st = self.client.get_state()
-                    tele_j = st.get("agent_telemetry") or {}
-                    last_act = tele_j.get("last_tool") or "idle"
-                    sum_j = AnsiTextMetrics.truncate_plain(tele_j.get("last_summary", "") or "", 56)
-                    job_lines = [
-                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.TOOL}Background Process Runner Monitor:{Theme.RESET}",
-                        f"     {Theme.TEXT}Agent activity:{Theme.RESET} {Theme.SUCCESS}[active]{Theme.RESET} {last_act} ({sum_j})",
-                        f"     {Theme.MUTED}Use /urgent or bridge tools to schedule and inspect execution.{Theme.RESET}",
-                    ]
-                    self._emit_system_box("\n".join(job_lines))
+                    self._emit_system_box(self._build_jobs_box())
                     continue
 
                 if low in {"/ayuda", "/help"}:
@@ -1854,7 +2019,16 @@ class MessengerController:
                     continue
 
                 self.turn_calls = 0
-                res = self.client.send_user_message(txt, priority=prio)
+                try:
+                    res = self.client.send_user_message(txt, priority=prio)
+                except Exception as exc:
+                    self.server_online = False
+                    self.poll_failures += 1
+                    self._emit_system_box(
+                        f"  {Theme.MUTED}{Theme.CONNECTOR} {Theme.ERROR}"
+                        f"[failed to send message: {exc}]{Theme.RESET}"
+                    )
+                    continue
                 msg = res.get("message") or {}
                 mid = msg.get("id", "")
                 if mid:
